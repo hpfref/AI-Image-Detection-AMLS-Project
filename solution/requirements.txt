@@ -1,0 +1,15 @@
+# Runtime dependencies for the AMLS 2026 solution container.
+# CPU-only — no GPU wheels (see PDF §Submission Guidelines).
+#
+# torch is installed in the Dockerfile via the official CPU index URL,
+# NOT pinned here, because the standard PyPI wheel is GPU-enabled and
+# would push the image well past the 4 GB limit.
+#
+# Pin versions before submission for reproducibility.
+
+numpy
+pandas
+pyarrow
+pillow
+scikit-learn
+tqdm

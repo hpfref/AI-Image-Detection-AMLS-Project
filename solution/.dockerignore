@@ -1,0 +1,13 @@
+# Keep the image small (<= 4 GB total per PDF).
+# Anything listed here will NOT be copied by `COPY . /workspace/solution`.
+
+artifacts/
+data/
+*.pdf
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
+.gitignore
+.dockerignore

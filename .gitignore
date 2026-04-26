@@ -1,0 +1,25 @@
+# Submission outputs (generated at runtime in the grader's container)
+solution/artifacts/
+
+# Grader-mounted, read-only at runtime — never commit
+solution/data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Submission archive
+*.zip
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
