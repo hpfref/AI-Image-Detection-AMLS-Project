@@ -32,22 +32,19 @@ IMG_SIZE = 224
 
 
 def read_parquet_split(split_dir: Path) -> Iterator[Tuple[bytes, Optional[int]]]:
-    """Yield (image_bytes, source_class) for labeled splits, or (image_bytes, None) for predict.
-
-    Streams in batches; only one batch is live in memory at a time.
-    """
+    """Yield (image_bytes, source_class) for labeled splits, or (image_bytes, None) for predict."""
     import pyarrow.parquet as pq
 
     for path in sorted(split_dir.glob("*.parquet")):
-        pf = pq.ParquetFile(path)
-        has_label = "source_class" in pf.schema_arrow.names
+        schema = pq.read_schema(path)
+        has_label = "source_class" in schema.names
         cols = ["image", "source_class"] if has_label else ["image"]
-        for batch in pf.iter_batches(batch_size=256, columns=cols):
-            imgs = batch.column("image")
-            labels = batch.column("source_class") if has_label else None
-            for i in range(len(imgs)):
-                label = int(labels[i].as_py()) if labels is not None else None
-                yield imgs[i].as_py(), label
+        table = pq.read_table(path, columns=cols)
+        imgs = table.column("image")
+        labels = table.column("source_class") if has_label else None
+        for i in range(len(table)):
+            label = int(labels[i].as_py()) if labels is not None else None
+            yield imgs[i].as_py(), label
 
 
 def read_predict_split(predict_dir: Path) -> Iterator[Tuple[int, bytes]]:
@@ -55,12 +52,11 @@ def read_predict_split(predict_dir: Path) -> Iterator[Tuple[int, bytes]]:
     import pyarrow.parquet as pq
 
     for path in sorted(predict_dir.glob("*.parquet")):
-        pf = pq.ParquetFile(path)
-        for batch in pf.iter_batches(batch_size=256, columns=["row_id", "image"]):
-            row_ids = batch.column("row_id")
-            imgs = batch.column("image")
-            for i in range(len(imgs)):
-                yield int(row_ids[i].as_py()), imgs[i].as_py()
+        table = pq.read_table(path, columns=["row_id", "image"])
+        row_ids = table.column("row_id")
+        imgs = table.column("image")
+        for i in range(len(table)):
+            yield int(row_ids[i].as_py()), imgs[i].as_py()
 
 
 def decode_image(image_bytes: bytes):

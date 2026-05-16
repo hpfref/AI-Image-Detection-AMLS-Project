@@ -22,8 +22,11 @@ def set_deterministic(seed: int = 0) -> None:
     try:
         import torch
         torch.manual_seed(seed)
-        # Match Appendix C — grader runs with --cpus 8.
+        # Match Appendix C -- grader runs with --cpus 8.
         torch.set_num_threads(min(8, os.cpu_count() or 1))
-        torch.set_num_interop_threads(1)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass  # can only be set once before parallel work starts
     except ImportError:
         pass

@@ -65,28 +65,22 @@ def _count_classes(split_dir: Path) -> dict[int, int]:
     """Read only source_class column — never touches image bytes."""
     counts: dict[int, int] = {}
     for path in sorted(split_dir.glob("*.parquet")):
-        pf = pq.ParquetFile(path)
-        for batch in pf.iter_batches(batch_size=4096, columns=["source_class"]):
-            col = batch.column("source_class").to_numpy(zero_copy_only=False)
-            for val, cnt in zip(*np.unique(col, return_counts=True)):
-                counts[int(val)] = counts.get(int(val), 0) + int(cnt)
+        col = pq.read_table(path, columns=["source_class"]).column("source_class").to_numpy(zero_copy_only=False)
+        for val, cnt in zip(*np.unique(col, return_counts=True)):
+            counts[int(val)] = counts.get(int(val), 0) + int(cnt)
     return counts
 
 
 def _sample_labeled(split_dir: Path, per_file: int, seed: int) -> list[tuple[int, bytes]]:
-    """Return up to per_file rows per parquet file as (source_class, image_bytes).
-
-    Reads only the first batch from each file — deterministic and fast.
-    """
+    """Up to per_file randomly sampled rows per parquet file as (source_class, image_bytes)."""
     rng = np.random.default_rng(seed)
     records: list[tuple[int, bytes]] = []
     for path in sorted(split_dir.glob("*.parquet")):
-        pf = pq.ParquetFile(path)
-        batch = next(pf.iter_batches(batch_size=per_file * 2, columns=["image", "source_class"]))
-        n = len(batch)
+        table = pq.read_table(path, columns=["image", "source_class"])
+        n = len(table)
         idxs = rng.choice(n, size=min(per_file, n), replace=False)
-        imgs = batch.column("image")
-        labels = batch.column("source_class")
+        imgs = table.column("image")
+        labels = table.column("source_class")
         for i in idxs:
             records.append((int(labels[i].as_py()), imgs[i].as_py()))
     return records
@@ -192,23 +186,19 @@ def clean_pipeline(artifact_dir: Path, deadline: float) -> None:
         for path in sorted(train_dir.glob("*.parquet")):
             if timed_out:
                 break
-            pf = pq.ParquetFile(path)
-            row_offset = 0
-            for batch in pf.iter_batches(batch_size=64, columns=["image", "source_class"]):
+            table = pq.read_table(path, columns=["image", "source_class"])
+            imgs = table.column("image")
+            labels = table.column("source_class")
+            for i in range(len(table)):
                 if time.perf_counter() > deadline:
                     timed_out = True
                     break
-                imgs = batch.column("image")
-                labels = batch.column("source_class")
-                for i in range(len(imgs)):
-                    label = int(labels[i].as_py())
-                    valid = _io.clean_image(imgs[i].as_py()) is not None
-                    writer.writerow([path.name, row_offset + i,
-                                     label, binarize_label(label), int(valid)])
-                    n_total += 1
-                    n_valid += int(valid)
-                    n_invalid += int(not valid)
-                row_offset += len(imgs)
+                label = int(labels[i].as_py())
+                valid = _io.clean_image(imgs[i].as_py()) is not None
+                writer.writerow([path.name, i, label, binarize_label(label), int(valid)])
+                n_total += 1
+                n_valid += int(valid)
+                n_invalid += int(not valid)
 
     if timed_out:
         print(f"Time limit reached after {n_total} rows.")
@@ -234,6 +224,13 @@ def main() -> int:
 
     start = time.perf_counter()
     deadline = start + args.timeout_seconds - 30  # 30 s safety margin before hard kill
+
+    # Paths in _io are relative; Docker runtime cwd is /workspace/solution. Fail loudly
+    # if the script was launched from elsewhere so we don't crash deep inside print formatting.
+    if not (_io.DATA_ROOT / "train").exists() or not list((_io.DATA_ROOT / "train").glob("*.parquet")):
+        print(f"ERROR: no parquet files under {(_io.DATA_ROOT / 'train').resolve()}", file=sys.stderr)
+        print("       run from solution/  (cd solution && python clean.py ...)", file=sys.stderr)
+        return 2
 
     _seed.set_deterministic(0)
     artifact_dir = _io.ensure_artifact_dir("clean")

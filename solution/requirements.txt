@@ -1,15 +1,15 @@
 # Runtime dependencies for the AMLS 2026 solution container.
-# CPU-only — no GPU wheels (see PDF §Submission Guidelines).
+# CPU-only -- no GPU wheels (see PDF Appendix A).
 #
-# torch is installed in the Dockerfile via the official CPU index URL,
-# NOT pinned here, because the standard PyPI wheel is GPU-enabled and
-# would push the image well past the 4 GB limit.
+# torch is installed separately in the Dockerfile via the official CPU index URL
+# because the standard PyPI wheel is GPU-enabled and exceeds the 4 GB image limit.
 #
-# Pin versions before submission for reproducibility.
+# pyarrow is pinned to 12.x -- versions >= 14 introduced a stricter parquet
+# repetition-level histogram check that rejects the encoding used in this dataset.
 
-numpy
-pandas
-pyarrow
-pillow
-scikit-learn
-tqdm
+numpy==1.26.4
+pandas==2.2.2
+pyarrow==16.1.0
+pillow==10.4.0
+scikit-learn==1.5.1
+tqdm==4.66.5
