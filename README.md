@@ -8,7 +8,7 @@ See [AMLS_2026_Exercise.pdf](AMLS_2026_Exercise.pdf) for the full spec.
 
 ## Team
 
-- TODO: list team members here (1-3 people, names go in `report/report.md` too).
+- Hannes Pohnke (469945)
 
 ## Repository layout
 

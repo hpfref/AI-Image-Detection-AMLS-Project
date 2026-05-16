@@ -15,6 +15,8 @@ The binary label is the one used everywhere in the pipeline.
 
 from __future__ import annotations
 
+from _lib import io as _io
+
 
 def binarize_label(source_class: int) -> int:
     """0 stays 0 (real); 1..5 collapse to 1 (ai_generated)."""
@@ -22,24 +24,30 @@ def binarize_label(source_class: int) -> int:
 
 
 class LabeledImageDataset:
-    """Iterable over (image_tensor, binary_label) pairs.
+    """Iterable over (image_array, binary_label) pairs.
 
-    Used by clean.py / prepare.py / train.py / train_augmented.py for the
-    labeled splits.
+    Streams from parquet; memory footprint is one batch at a time.
+    Used by prepare.py, train.py, and train_augmented.py.
     """
 
     def __init__(self, split_dir, transform=None):
-        # TODO: stream parquet via _lib.io.read_parquet_split, decode images,
-        # apply `transform`, yield (image_tensor, binarize_label(source_class)).
         self.split_dir = split_dir
         self.transform = transform
 
     def __iter__(self):
-        raise NotImplementedError("Task 1.1/1.2: implement labeled dataset iterator")
+        for img_bytes, label in _io.read_parquet_split(self.split_dir):
+            if label is None:
+                continue
+            arr = _io.clean_image(img_bytes)
+            if arr is None:
+                continue
+            if self.transform is not None:
+                arr = self.transform(arr)
+            yield arr, binarize_label(label)
 
 
 class PredictDataset:
-    """Iterable over (row_id, image_tensor) pairs for data/predict/.
+    """Iterable over (row_id, image_array) pairs for data/predict/.
 
     Used by predict.py and predict_augmented.py only.
     """
@@ -49,4 +57,10 @@ class PredictDataset:
         self.transform = transform
 
     def __iter__(self):
-        raise NotImplementedError("Task 1.2: implement predict dataset iterator")
+        for row_id, img_bytes in _io.read_predict_split(self.predict_dir):
+            arr = _io.clean_image(img_bytes)
+            if arr is None:
+                continue
+            if self.transform is not None:
+                arr = self.transform(arr)
+            yield row_id, arr

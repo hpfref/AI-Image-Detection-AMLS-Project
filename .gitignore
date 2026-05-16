@@ -1,13 +1,16 @@
-# Submission outputs (generated at runtime in the grader's container)
+# Runtime outputs (generated in the grader's container)
 solution/artifacts/
 
-# Grader-mounted, read-only at runtime — never commit
+# Grader-mounted, read-only at runtime
 solution/data/
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+dist/
+build/
 .venv/
 venv/
 .env
@@ -15,14 +18,24 @@ venv/
 # Notebooks
 .ipynb_checkpoints/
 
+# Model / data artefacts that might land outside artifacts/
+*.pt
+*.pth
+*.pkl
+*.npy
+*.npz
+*.log
+
 # Submission archive
 *.zip
 
-# IDE / OS 
+# IDE / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
+# Tools
 .serena/
 .claude/
+claude.md

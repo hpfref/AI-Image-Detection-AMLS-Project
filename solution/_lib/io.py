@@ -1,5 +1,5 @@
 """
-Parquet I/O and artifact-path helpers.
+Parquet I/O, image decoding, and artifact-path helpers.
 
 Dataset structure (PDF §Dataset structure):
     data/train/                        parquet, columns image: binary, source_class: int8
@@ -9,8 +9,8 @@ Dataset structure (PDF §Dataset structure):
     data/validation_augmented/         parquet, same schema
     data/predict/                      parquet, columns row_id: int32, image: binary
 
-Artifact layout we produce under solution/artifacts/ at runtime:
-    artifacts/clean/                   cleaned training data (Task 1.1)
+Artifact layout produced under solution/artifacts/:
+    artifacts/clean/                   train manifest CSV (Task 1.1)
     artifacts/prepared/                tensor caches / feature matrices (Task 1.2)
     artifacts/task02/best.pt           best Task 2 checkpoint
     artifacts/task02/threshold.json    calibrated threshold (FPR <= 0.20)
@@ -22,28 +22,75 @@ Artifact layout we produce under solution/artifacts/ at runtime:
 
 from __future__ import annotations
 
+import io as _stdlib_io
 from pathlib import Path
-from typing import Iterator, Tuple
+from typing import Iterator, Optional, Tuple
 
-
-# Conventional roots — pipeline scripts use these instead of hardcoding strings.
 DATA_ROOT = Path("data")
 ARTIFACTS_ROOT = Path("artifacts")
+IMG_SIZE = 224
 
 
-def read_parquet_split(split_dir: Path) -> Iterator[Tuple[bytes, int | None]]:
-    """Yield (image_bytes, label_or_None) over all parquet files in a split.
+def read_parquet_split(split_dir: Path) -> Iterator[Tuple[bytes, Optional[int]]]:
+    """Yield (image_bytes, source_class) for labeled splits, or (image_bytes, None) for predict.
 
-    For labeled splits (train / calibration / validation, with or without
-    _augmented suffix), label is the int8 source_class. For data/predict/,
-    label is None.
+    Streams in batches; only one batch is live in memory at a time.
     """
-    raise NotImplementedError("Task 1.1: implement parquet streaming reader")
+    import pyarrow.parquet as pq
+
+    for path in sorted(split_dir.glob("*.parquet")):
+        pf = pq.ParquetFile(path)
+        has_label = "source_class" in pf.schema_arrow.names
+        cols = ["image", "source_class"] if has_label else ["image"]
+        for batch in pf.iter_batches(batch_size=256, columns=cols):
+            imgs = batch.column("image")
+            labels = batch.column("source_class") if has_label else None
+            for i in range(len(imgs)):
+                label = int(labels[i].as_py()) if labels is not None else None
+                yield imgs[i].as_py(), label
+
+
+def read_predict_split(predict_dir: Path) -> Iterator[Tuple[int, bytes]]:
+    """Yield (row_id, image_bytes) for the unlabeled predict split."""
+    import pyarrow.parquet as pq
+
+    for path in sorted(predict_dir.glob("*.parquet")):
+        pf = pq.ParquetFile(path)
+        for batch in pf.iter_batches(batch_size=256, columns=["row_id", "image"]):
+            row_ids = batch.column("row_id")
+            imgs = batch.column("image")
+            for i in range(len(imgs)):
+                yield int(row_ids[i].as_py()), imgs[i].as_py()
 
 
 def decode_image(image_bytes: bytes):
-    """Decode the binary image column to a numpy / PIL image."""
-    raise NotImplementedError("Task 1.1: implement image decoding")
+    """Decode binary bytes to a PIL Image in RGB mode."""
+    from PIL import Image
+    return Image.open(_stdlib_io.BytesIO(image_bytes)).convert("RGB")
+
+
+def clean_image(image_bytes: bytes):
+    """Decode, resize shorter-edge to IMG_SIZE, center-crop to IMG_SIZE x IMG_SIZE.
+
+    Aspect-preserving resize avoids encoding original dimensions as a class signal
+    (AI images are always square, real images are not).
+    Returns (IMG_SIZE, IMG_SIZE, 3) float32 in [0, 1], or None if unreadable.
+    """
+    import numpy as np
+    from PIL import Image
+
+    try:
+        im = Image.open(_stdlib_io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        return None
+    w, h = im.size
+    scale = IMG_SIZE / min(w, h)
+    nw, nh = int(round(w * scale)), int(round(h * scale))
+    im = im.resize((nw, nh), Image.BILINEAR)
+    left = (nw - IMG_SIZE) // 2
+    top = (nh - IMG_SIZE) // 2
+    im = im.crop((left, top, left + IMG_SIZE, top + IMG_SIZE))
+    return np.asarray(im, dtype=np.float32) / 255.0
 
 
 def ensure_artifact_dir(*parts: str) -> Path:
