@@ -36,6 +36,6 @@ venv/
 Thumbs.db
 
 # Tools
-.serena/
-.claude/
-claude.md
+#.serena/
+#.claude/
+#claude.md
