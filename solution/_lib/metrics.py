@@ -12,17 +12,34 @@ from __future__ import annotations
 
 from typing import Sequence
 
+import numpy as np
+
 
 def recall_ai(y_true: Sequence[int], y_pred: Sequence[int]) -> float:
     """Recall on the AI class (label = 1)."""
-    raise NotImplementedError("Task 1.2: implement recall_ai")
+    yt = np.asarray(y_true)
+    yp = np.asarray(y_pred)
+    tp = int(((yp == 1) & (yt == 1)).sum())
+    fn = int(((yp == 0) & (yt == 1)).sum())
+    return tp / (tp + fn) if (tp + fn) > 0 else 0.0
 
 
 def fpr_real(y_true: Sequence[int], y_pred: Sequence[int]) -> float:
     """False-positive rate on real images (label = 0 misclassified as 1)."""
-    raise NotImplementedError("Task 1.2: implement fpr_real")
+    yt = np.asarray(y_true)
+    yp = np.asarray(y_pred)
+    fp = int(((yp == 1) & (yt == 0)).sum())
+    tn = int(((yp == 0) & (yt == 0)).sum())
+    return fp / (fp + tn) if (fp + tn) > 0 else 0.0
 
 
-def confusion(y_true: Sequence[int], y_pred: Sequence[int]):
-    """Return a 2x2 confusion matrix as a dict or array — used in the report."""
-    raise NotImplementedError("Task 1.2: implement confusion matrix")
+def confusion(y_true: Sequence[int], y_pred: Sequence[int]) -> dict:
+    """Return tn, fp, fn, tp counts as a dict."""
+    yt = np.asarray(y_true)
+    yp = np.asarray(y_pred)
+    return {
+        "tn": int(((yp == 0) & (yt == 0)).sum()),
+        "fp": int(((yp == 1) & (yt == 0)).sum()),
+        "fn": int(((yp == 0) & (yt == 1)).sum()),
+        "tp": int(((yp == 1) & (yt == 1)).sum()),
+    }
