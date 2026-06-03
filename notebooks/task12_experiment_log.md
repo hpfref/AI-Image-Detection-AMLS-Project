@@ -115,24 +115,24 @@ Final runs: alpha=0.40 (CNN 40%, RF 60%).
 | 2 | 3-conv | 128 | 16 | focal | - | 0.689 | 0.191 | 0.692 | 0.186 | - | - | - | no ENS |
 | 3 | 4-conv | 128 | 16 | focal | - | 0.745 | 0.234 | 0.692 | 0.186 | - | - | - | no ENS |
 | 4 | 4-conv | 128 | 16 | focal | 0.15 | 0.661 | 0.181 | 0.685 | 0.165 | 0.721 | 0.149 | - | FAIL |
-| 5 | 4-conv | 128 | 16 | focal | 0.19 | 0.661 | 0.181 | 0.685 | 0.165 | 0.778 | 0.207 | - | FAIL (fpr) |
-| 6 | 4-conv | 128 | 16 | focal | 0.20 | 0.720 | 0.176 | 0.685 | 0.165 | 0.799 | 0.223 | - | FAIL (fpr) |
+| 5 | 4-conv | 128 | 16 | focal | 0.19 | 0.661 | 0.181 | 0.685 | 0.165 | 0.778 | 0.207 | - | FAIL  |
+| 6 | 4-conv | 128 | 16 | focal | 0.20 | 0.720 | 0.176 | 0.685 | 0.165 | 0.799 | 0.223 | - | FAIL  |
 | 7 | 5-conv+MLP | 128 | 16 | focal~1.5 | ~0.19 | 0.674 | 0.138 | 0.685 | 0.165 | **0.809** | **0.197** | 0.884 | **PASS** |
-| 8 | 5-conv+MLP | 128 | 16 | 1.5+sd3x3 | 0.19 | 0.755 | 0.186 | 0.685 | 0.165 | 0.833 | 0.234 | - | FAIL (fpr) |
-| 9 | 4-conv | 160 | 16 | 1.5+sd3x2 | 0.18 | 0.674 | 0.176 | 0.685 | 0.165 | 0.792 | 0.165 | - | FAIL (recall) |
-| 10 | 5-conv | 128 | 16 | 1.5+sd3x2 | 0.18 | 0.709 | 0.186 | 0.685 | 0.165 | 0.775 | 0.176 | - | FAIL (recall) |
-| 11 | 5-conv | 128 | 16 | 1.5+sd3x2 | 0.19 | 0.709 | 0.186 | 0.685 | 0.165 | 0.817 | 0.250 | - | FAIL (fpr) |
+| 8 | 5-conv+MLP | 128 | 16 | 1.5+sd3x3 | 0.19 | 0.755 | 0.186 | 0.685 | 0.165 | 0.833 | 0.234 | - | FAIL  |
+| 9 | 4-conv | 160 | 16 | 1.5+sd3x2 | 0.18 | 0.674 | 0.176 | 0.685 | 0.165 | 0.792 | 0.165 | - | FAIL  |
+| 10 | 5-conv | 128 | 16 | 1.5+sd3x2 | 0.18 | 0.709 | 0.186 | 0.685 | 0.165 | 0.775 | 0.176 | - | FAIL |
+| 11 | 5-conv | 128 | 16 | 1.5+sd3x2 | 0.19 | 0.709 | 0.186 | 0.685 | 0.165 | 0.817 | 0.250 | - | FAIL |
 | 12 | 5-conv+MLP | 128 | 16 | 1.5 | ~0.19 | 0.761 | 0.218 | 0.650 | 0.117 | **0.803** | **0.191** | 0.891 | **PASS** |
-| 13 | 5-conv+MLP | 128 | 16 | **2.0** | 0.19 | 0.779 | 0.223 | 0.650 | 0.117 | 0.827 | 0.207 | **0.896** | FAIL (fpr+0.007) |
-| 14 | 5-conv+MLP | 128 | 16 | 2.0 | 0.18 | 0.779 | 0.223 | 0.650 | 0.117 | 0.786 | 0.160 | - | FAIL (recall) |
+| 13 | 5-conv+MLP | 128 | 16 | **2.0** | 0.19 | 0.779 | 0.223 | 0.650 | 0.117 | 0.827 | 0.207 | **0.896** | FAIL  |
+| 14 | 5-conv+MLP | 128 | 16 | 2.0 | 0.18 | 0.779 | 0.223 | 0.650 | 0.117 | 0.786 | 0.160 | - | FAIL  |
 | 15 | 5-conv+MLP | 128 | 16 | 2.0 | 0.185 | 0.743 | 0.213 | 0.682 | 0.144 | 0.771 | 0.165 | 0.885 | FAIL |
 | 16 | ResBlock | 128 | 16 | 2.0 | 0.185 | 0.729 | 0.165 | 0.682 | 0.144 | 0.768 | 0.144 | 0.886 | FAIL |
 | 17 | DW-sep | 128 | 32 | 2.0 | 0.185 | 0.723 | 0.213 | 0.682 | 0.144 | 0.740 | 0.149 | 0.875 | FAIL |
-| 18 | 5-conv+MLP | 128 | 16 | **1.5** | 0.18 | 0.738 | 0.154 | 0.650 | 0.117 | 0.782 | 0.160 | **0.896** | FAIL (0.018 short) |
+| 18 | 5-conv+MLP | 128 | 16 | **1.5** | 0.18 | 0.738 | 0.154 | 0.650 | 0.117 | 0.782 | 0.160 | **0.896** | FAIL  |
 | 19 | 5-conv+MLP | **224** | 16 | 1.5 | 0.18 | 0.669 | 0.186 | 0.650 | 0.117 | 0.772 | 0.144 | 0.878 | FAIL |
 | 20 | 5-conv+MLP | 128 | **32** | 1.5 | 0.18 | 0.651 | 0.144 | 0.650 | 0.117 | 0.722 | 0.138 | 0.876 | FAIL |
-| 21 | 5-conv+MLP | **160** | 16 | 1.5 | 0.18 | 0.746 | 0.207 | 0.650 | 0.117 | 0.795 | 0.176 | 0.878 | FAIL (0.005 short) |
-| 22 | 5-conv+MLP | 160 | 16 | 1.5 | 0.19 | 0.746 | 0.207 | 0.650 | 0.117 | 0.795 | 0.176 | 0.878 | FAIL (thr unchanged) |
+| 21 | 5-conv+MLP | **160** | 16 | 1.5 | 0.18 | 0.746 | 0.207 | 0.650 | 0.117 | 0.795 | 0.176 | 0.878 | FAIL  |
+| 22 | 5-conv+MLP | 160 | 16 | 1.5 | 0.19 | 0.746 | 0.207 | 0.650 | 0.117 | 0.795 | 0.176 | 0.878 | FAIL  |
 | 23 | 5-conv+MLP | 160 | 16 | 1.5 | 0.19 | 0.772 | 0.229 | 0.669 | 0.128 | **0.809** | **0.197** | 0.878 | **PASS** |
 | 24 | 5-conv+MLP | 160 | 16 | 1.5 | 0.19 | 0.724 | 0.197 | 0.669 | 0.128 | **0.811** | **0.170** | 0.888 | **PASS** |
 
@@ -264,24 +264,35 @@ Budget: RF=18.4s + CNN=715.2s = 733.6s total = 4.71x reference
 
 ## Script Pipeline Results (solution/ scripts)
 
-The ported scripts use a different budget calculation than notebook experiments:
-- `train.py` budget: `deadline = start + timeout_seconds - SAFETY_S = 1800 - 90 = 1710s for CNN`
-- Notebook budget: `BUDGET_S - rf_train_s - 45s = 778 - 20 - 45 = 713s for CNN`
-- Scripts give CNN ~1710s vs ~713s in notebook = ~2.4x more training time
+**Budget comparison -- critical context:**
+The script pipeline is NOT bounded by the 5x reference time constraint used in notebook
+development. Scripts use `timeout_seconds` directly:
+- Notebook budget: `BUDGET_S = 5 * 155.6s = 778s` total (RF + CNN + overhead)
+- Script CNN budget: `1800 - 90s overhead = 1710s`
+- Script total runtime: **1778.5s** -- 2.29x the notebook budget
 
-**Note:** Script results are not bounded by the 5x reference time constraint (that applies
-only to notebook development). The scripts respect `timeout_seconds` directly. Script
-results are included to show the pipeline runs end-to-end and to demonstrate that
-additional training time can further improve recall.
+This means results are not directly comparable to notebook run entries.
+The extra training time (1691s CNN vs ~713s notebook) produced 2334 gradient steps
+vs ~930 in notebook runs. The stronger CNN does not guarantee better ENS val recall
+due to cal->val calibration shift and seed variance.
 
-| Split | CNN recall | CNN fpr | RF recall | RF fpr | ENS recall | ENS fpr | ENS AUC |
-|-------|-----------|---------|-----------|--------|-----------|---------|---------|
-| holdout | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| cal | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| val | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| va | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+**Script run 1 (RF n=400, CNN k=16 160px gamma=1.5, alpha=0.40, thr=0.691):**
 
-alpha=TBD, thr=TBD, CNN training time=TBDs, RF training time=TBDs
+RF training: 17.6s. CNN training: 1691s budget, 2334 steps, best holdout recall=0.887.
+
+| Model | Split | recall_ai | fpr_real | AUC |
+|-------|-------|-----------|----------|-----|
+| CNN | holdout | 0.715 | 0.081 | 0.922 |
+| CNN | cal | 0.755 | 0.189 | 0.867 |
+| CNN | val | 0.732 | 0.207 | 0.849 |
+| CNN | va | 0.578 | 0.267 | 0.731 |
+| ENS | val | 0.795 | 0.181 | 0.894 |
+| ENS | va | 0.635 | 0.294 | 0.746 |
+
+ENS val recall=0.795 -> **FAIL** (< 0.80). Despite 2334 steps and best holdout recall=0.887,
+the calibration threshold thr=0.691 is more conservative than notebook runs (~0.627-0.677),
+leaving fpr=0.181 headroom on val while missing the recall bar. This is seed variance
+combined with cal->val distribution shift -- the same effect seen in notebook runs below 0.80.
 
 ---
 

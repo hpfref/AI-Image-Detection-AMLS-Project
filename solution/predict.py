@@ -60,7 +60,7 @@ def main() -> int:
             return 1
 
     import joblib
-    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     cnn  = build_cnn_bn(k=ckpt["k"])
     cnn.load_state_dict(ckpt["state"])
     cnn.eval()
