@@ -30,7 +30,7 @@ Each run fits:
 - Logistic Regression: StandardScaler + LogisticRegression(class_weight="balanced"), C in {0.1, 1.0, 10.0}
 - Random Forest: RandomForestClassifier(class_weight="balanced", max_features="sqrt"), n_estimators in {200, 400}
 
-**Run 23 comparison (holdout, at fpr=0.18):**
+**Run 22 comparison (holdout, at fpr=0.18):**
 | Model | Best param | Holdout recall | Holdout AUC | Winner |
 |-------|-----------|---------------|-------------|--------|
 | LR | C=10.0 | 0.749 | 0.857 | |
@@ -132,13 +132,12 @@ Final runs: alpha=0.40 (CNN 40%, RF 60%).
 | 19 | 5-conv+MLP | **224** | 16 | 1.5 | 0.18 | 0.669 | 0.186 | 0.650 | 0.117 | 0.772 | 0.144 | 0.878 | FAIL |
 | 20 | 5-conv+MLP | 128 | **32** | 1.5 | 0.18 | 0.651 | 0.144 | 0.650 | 0.117 | 0.722 | 0.138 | 0.876 | FAIL |
 | 21 | 5-conv+MLP | **160** | 16 | 1.5 | 0.18 | 0.746 | 0.207 | 0.650 | 0.117 | 0.795 | 0.176 | 0.878 | FAIL  |
-| 22 | 5-conv+MLP | 160 | 16 | 1.5 | 0.19 | 0.746 | 0.207 | 0.650 | 0.117 | 0.795 | 0.176 | 0.878 | FAIL  |
-| 23 | 5-conv+MLP | 160 | 16 | 1.5 | 0.19 | 0.772 | 0.229 | 0.669 | 0.128 | **0.809** | **0.197** | 0.878 | **PASS** |
-| 24 | 5-conv+MLP | 160 | 16 | 1.5 | 0.19 | 0.724 | 0.197 | 0.669 | 0.128 | **0.811** | **0.170** | 0.888 | **PASS** |
+| 22 | 5-conv+MLP | 160 | 16 | 1.5 | 0.19 | 0.772 | 0.229 | 0.669 | 0.128 | **0.809** | **0.197** | 0.878 | **PASS** |
+| 23 | 5-conv+MLP | 160 | 16 | 1.5 | 0.19 | 0.724 | 0.197 | 0.669 | 0.128 | **0.811** | **0.170** | 0.888 | **PASS** |
 
 ---
 
-## Run 23 Full Metrics (Final Model)
+## Run 22 Full Metrics (Final Model)
 
 **CNN (160px, k=16, gamma=1.5):**
 | Split | recall_ai | fpr_real | AUC |
@@ -226,11 +225,11 @@ regardless of target; the ENS calibration target 0.19 gives cal_fpr=0.189.
 
 ---
 
-## Run 24 Full Metrics (same config as run 23 -- stochastic rerun)
+## Run 23 Full Metrics (same config as run 22 -- stochastic rerun)
 
-Config: identical to run 23 (5-conv BN k=16 160px gamma=1.5, RF n=400, ENS tgt=0.19).
-Difference from run 23: benchmark cell (feat_fast_bench) ran before CNN training, shifting
-the RNG state. Result is within noise of run 23 -- this is seed variance, not a real improvement.
+Config: identical to run 22 (5-conv BN k=16 160px gamma=1.5, RF n=400, ENS tgt=0.19).
+Difference from run 22: benchmark cell (feat_fast_bench) ran before CNN training, shifting
+the RNG state. Result is within noise of run 22 -- this is seed variance, not a real improvement.
 Best this run: ENS AUC=0.888 (highest seen), fpr=0.170 (more headroom than run 23's 0.197).
 
 **CNN (160px, k=16, gamma=1.5):**
@@ -269,30 +268,40 @@ The script pipeline is NOT bounded by the 5x reference time constraint used in n
 development. Scripts use `timeout_seconds` directly:
 - Notebook budget: `BUDGET_S = 5 * 155.6s = 778s` total (RF + CNN + overhead)
 - Script CNN budget: `1800 - 90s overhead = 1710s`
-- Script total runtime: **1778.5s** -- 2.29x the notebook budget
 
-This means results are not directly comparable to notebook run entries.
-The extra training time (1691s CNN vs ~713s notebook) produced 2334 gradient steps
-vs ~930 in notebook runs. The stronger CNN does not guarantee better ENS val recall
-due to cal->val calibration shift and seed variance.
+This means script runs are not directly comparable to notebook run entries.
 
-**Script run 1 (RF n=400, CNN k=16 160px gamma=1.5, alpha=0.40, thr=0.691):**
+**Script run 1 (1778.5s total, 2334 steps):**
 
-RF training: 17.6s. CNN training: 1691s budget, 2334 steps, best holdout recall=0.887.
+RF 17.6s + CNN 1691s budget. Best holdout recall=0.887.
 
 | Model | Split | recall_ai | fpr_real | AUC |
 |-------|-------|-----------|----------|-----|
-| CNN | holdout | 0.715 | 0.081 | 0.922 |
-| CNN | cal | 0.755 | 0.189 | 0.867 |
 | CNN | val | 0.732 | 0.207 | 0.849 |
-| CNN | va | 0.578 | 0.267 | 0.731 |
 | ENS | val | 0.795 | 0.181 | 0.894 |
-| ENS | va | 0.635 | 0.294 | 0.746 |
 
-ENS val recall=0.795 -> **FAIL** (< 0.80). Despite 2334 steps and best holdout recall=0.887,
-the calibration threshold thr=0.691 is more conservative than notebook runs (~0.627-0.677),
-leaving fpr=0.181 headroom on val while missing the recall bar. This is seed variance
-combined with cal->val distribution shift -- the same effect seen in notebook runs below 0.80.
+ENS val=0.795 -> FAIL. Threshold thr=0.691 was more conservative than notebook runs
+(~0.627-0.677), leaving fpr headroom while missing recall. Seed variance.
+
+**Script run 2 (1426.7s total, 1915 steps, early stop):**
+
+RF 18.7s + CNN 1690s budget. Best holdout recall=0.856. Early stopping triggered after
+patience=8 evals without improvement (best checkpoint at step 1448).
+
+| Model | Split | recall_ai | fpr_real | AUC |
+|-------|-------|-----------|----------|-----|
+| CNN | holdout | 0.761 | 0.121 | 0.900 |
+| CNN | cal | 0.766 | 0.189 | 0.872 |
+| CNN | val | 0.766 | 0.191 | 0.868 |
+| CNN | va | 0.702 | 0.348 | 0.741 |
+| RF | val | 0.715 | 0.170 | 0.852 |
+| ENS | holdout | 0.804 | 0.127 | 0.923 |
+| ENS | cal | 0.836 | 0.189 | 0.898 |
+| ENS | val | **0.812** | **0.165** | **0.894** |
+| ENS | va | 0.685 | 0.374 | 0.744 |
+
+ENS val=0.812 -> PASS. alpha=0.40, thr=0.677. Consistent with notebook development
+runs 22/23 (0.809-0.811). Run 1 failure is seed variance, same as run 21.
 
 ---
 

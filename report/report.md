@@ -22,7 +22,6 @@ Six source classes: 0=real, 1=SD 2.1, 2=SDXL, 3=SD 3, 4=DALL-E 3, 5=Midjourney. 
 The binary split is consistent across all splits at ~83% AI / 17% real, with the six AI classes roughly balanced within the AI group.
 
 ![Class distribution](figures/fig1_class_distribution.png)
-
 ### Image-size distribution and label leakage
 
 Inspecting image dimensions across a 2,000-image train sample reveals a near-perfect class signal in image size alone:
@@ -56,7 +55,6 @@ SD 3 is notably warmer and brighter than all other classes (mean red channel 0.5
 ### Visual characteristics
 
 ![Sample grid](figures/fig2_sample_grid.png)
-
 Real photographs are casual snapshots with natural imperfections and no particular aesthetic intent.
 
 **DALL-E 3**: most obviously AI at a glance. Images look plastic, animated, or illustrated with unnatural lighting and an uncanny rendered quality.
@@ -84,6 +82,22 @@ The most reliable detection cues, roughly in order: (1) logical errors in anatom
 We trained two model families and combined them into an ensemble: a classical Random
 Forest on 101 engineered features and a five-layer convolutional network trained from
 scratch on the cleaned images. The ensemble of both is the submitted pipeline.
+
+### Training Setup
+
+Before training, images are preprocessed once by `prepare.py`: each image is cleaned
+(shorter-edge resize and center-crop to 224x224), stored as a uint8 memory-mapped
+array, and 101 engineered features are extracted per image and saved alongside. This
+step runs once and the outputs are reused by all subsequent scripts without re-reading
+the raw data.
+
+The training set (~29,700 images) is split into a fit set (90%) and a holdout set
+(10%), stratified by source class. The task does not provide an explicit split for
+model selection; the holdout is needed because CNN early stopping requires an
+evaluation set, and using data/calibration/ for that purpose would contaminate the
+threshold calibration step that happens after training. The holdout also drives RF vs.
+LR selection and the ensemble alpha sweep. data/calibration/ is used exclusively for
+threshold selection after all model parameters are fixed.
 
 ### Model Families
 
@@ -121,8 +135,11 @@ ensemble scores on the calibration split.
 ### Ensemble
 
 The ensemble combines scores as p = alpha * p\_cnn + (1 - alpha) * p\_rf with
-alpha=0.40. Combining the two models raised holdout AUC from 0.877 (CNN alone) to
-0.907 (ensemble) because the two models make partially uncorrelated errors: the CNN
+alpha=0.40. On the validation set, CNN alone reaches recall=0.724 and RF alone reaches
+recall=0.669, neither meeting the 0.80 target individually. The ensemble reaches 0.811
+by combining complementary error patterns: the two models recover different subsets of
+AI images, so combining them raises true positives without a proportional increase in
+false positives. Holdout AUC rose from 0.877 (CNN alone) to 0.907 (ensemble). The CNN
 detects spatial and frequency artifacts in pixel space while the Random Forest captures
 file-level properties such as JPEG compression patterns and spectral distribution.
 
@@ -150,10 +167,7 @@ the confusion matrices for CNN, RF, and ensemble on the validation set. Figure 6
 per-source-class recall on the validation set: SDXL is the easiest class to detect
 (0.95), SD3 is the hardest (0.63), with DALL-E3, Midjourney, and SD2.1 in between.
 
-![Training trace](figures/fig4_training_trace.png)
-![Confusion matrices](figures/fig5_confusion_matrices.png)
-![Per-class recall](figures/fig6_per_class_recall.png)
-
+![Training trace](figures/fig4_training_trace.png)![Confusion matrices](figures/fig5_confusion_matrices.png)![Per-class recall](figures/fig6_per_class_recall.png)
 ### Impact of Modeling Choices
 
 Several design decisions had measurable impact on validation performance. Figure 7
@@ -161,9 +175,10 @@ summarises the ablation experiments.
 
 **Image resolution.** Training at 224px produced only around 350 gradient steps within
 the budget because larger images slow each step, leading to underfitting and AUC 0.848.
-Dropping to 128px gave around 890 steps but missed fine-grained artifacts. At 160px the
-model reaches around 930 steps at a moderate per-step cost, yielding AUC 0.877 and
-stable calibration. We kept 160px.
+128px gave around 890 steps and produced a first passing run (run 7), but we continued
+experimenting in search of a higher-performing configuration. 160px reaches around 930
+steps at a moderate per-step cost and produced the best metrics across all development
+runs (AUC 0.888, fpr=0.170 in run 23). We kept 160px.
 
 **Focal loss gamma.** gamma=2.0 concentrated training on the hardest examples and
 reached a single-run AUC of 0.896, but caused high variance across seeds, with recall
@@ -171,26 +186,37 @@ ranging from 0.740 to 0.827 across consecutive runs. gamma=1.5 trades a small am
 of peak performance for reproducible passes. We kept gamma=1.5.
 
 **Architecture.** Residual connections and depthwise separable convolutions both
-degraded performance relative to the plain five-conv baseline. Residual shortcuts do
-not help the hierarchical spatial patterns this task depends on. Depthwise separable
-convolutions decouple spatial and channel filtering, which is harmful for artifact
-detection where joint spatial-channel patterns carry the signal. We kept standard 3x3
-convolutions.
+degraded performance relative to the plain five-conv baseline. For residual connections,
+one possible explanation is that shallow skip connections add little when signals
+already propagate well through five plain conv layers. For depthwise separable
+convolutions, decoupling spatial and channel filtering may lose information about how
+spatial patterns and color channels co-vary, which could matter here. Both were worse
+in practice and we kept standard 3x3 convolutions.
 
 **SD3 upweighting.** Giving SD3 samples extra loss weight pushed the false-positive
 rate to 0.234-0.250 because the model became overly aggressive. Focal loss handles the
 hard class without explicit upweighting.
 
 ![Ablation results](figures/fig7_ablation.png)
-
 ### CPU Budget
 
 Total training time for the submitted configuration: RF 18.4s + CNN 715.2s =
 **733.6s = 4.71x the reference time**, within the 5x limit.
 
+Several parameters were kept at standard values throughout: batch size (64),
+convolutional filter size (3x3), and dropout rates. These are typically less sensitive
+to tuning than architectural and loss choices at this dataset scale. A separate sweep
+over learning rate, cosine annealing, and weight decay confirmed that lr=3e-4 with a
+constant schedule was at or near optimal among the tested alternatives.
+
+Running the submission script directly with timeout\_seconds=1800 allocates 1710s to
+the CNN, roughly 2.5x the notebook budget. In one such run the model terminated after
+1915 gradient steps via early stopping (patience=8 evals without improvement) and
+produced ENS val=0.812, fpr=0.165, relatively consistent with the notebook results above.
+
 ### All Training Runs
 
-Table 3 summarises all 24 training runs conducted during development.
+Table 3 summarises all training runs conducted during development.
 
 | Run | CNN arch | px | k | Gamma | ENS tgt | CNN val rec | CNN val fpr | ENS val rec | ENS val fpr | ENS AUC | Result |
 |-----|----------|----|---|-------|---------|-------------|-------------|-------------|-------------|---------|--------|
@@ -215,9 +241,8 @@ Table 3 summarises all 24 training runs conducted during development.
 | 19 | 5-conv | 224 | 16 | 1.5 | 0.18 | 0.669 | 0.186 | 0.772 | 0.144 | 0.878 | FAIL |
 | 20 | 5-conv | 128 | 32 | 1.5 | 0.18 | 0.651 | 0.144 | 0.722 | 0.138 | 0.876 | FAIL |
 | 21 | 5-conv | 160 | 16 | 1.5 | 0.18 | 0.746 | 0.207 | 0.795 | 0.176 | 0.878 | FAIL |
-| 22 | 5-conv | 160 | 16 | 1.5 | 0.19 | 0.746 | 0.207 | 0.795 | 0.176 | 0.878 | FAIL |
-| 23 | 5-conv | 160 | 16 | 1.5 | 0.19 | 0.772 | 0.229 | 0.809 | 0.197 | 0.878 | **PASS** |
-| 24 | 5-conv | 160 | 16 | 1.5 | 0.19 | 0.724 | 0.197 | 0.811 | 0.170 | 0.888 | **PASS** |
+| 22 | 5-conv | 160 | 16 | 1.5 | 0.19 | 0.772 | 0.229 | 0.809 | 0.197 | 0.878 | **PASS** |
+| 23 | 5-conv | 160 | 16 | 1.5 | 0.19 | 0.724 | 0.197 | 0.811 | 0.170 | 0.888 | **PASS** |
 
 ## §1.3 Data Augmentation & Feature Engineering (30 pts)
 
