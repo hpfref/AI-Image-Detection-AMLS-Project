@@ -67,7 +67,7 @@ The ensemble uses `p_rf = LR_PIPE.predict_proba(F)[:, 1]` which is therefore RF 
 
 **Rationale for added features:** AI images (especially from diffusion models) show different spectral profiles, less natural color skewness, different chroma noise patterns, and fewer JPEG block artifacts than real camera images.
 
-**Final model:** RandomForestClassifier(n_estimators=400, class_weight="balanced", max_features="sqrt")
+**Selected classical model (RF, all recent runs):** RandomForestClassifier(n_estimators=400, class_weight="balanced", max_features="sqrt")
 **Threshold calibration:** pick_threshold_for_fpr on data/calibration/, target_fpr=0.19
 
 ### Neural Network: CNN
@@ -78,32 +78,28 @@ The ensemble uses `p_rf = LR_PIPE.predict_proba(F)[:, 1]` which is therefore RF 
 - Run 12-14: 5-conv k=16 128px (original focal gamma, then gamma=2.0)
 - Run 15-17: gamma=2.0 experiments (ResBlock, DW-sep - both worse)
 - Run 18-23: standard 5-conv k=16, gamma=1.5 reverted, resolution experiments
+- Run 24: ResNet-SE redesign (stem stride-4 + 4 residual+SE stages 32->256, 192px,
+  warmup+cosine LR) - the current architecture
 
-**Final architecture (run 23):**
-```
-Conv(3->k) BN ReLU -> MaxPool(2)
-Conv(k->2k) BN ReLU -> MaxPool(2)
-Conv(2k->4k) BN ReLU
-Conv(4k->8k) BN ReLU
-Conv(8k->8k) BN ReLU
-AdaptiveAvgPool2d(1) -> Flatten
-Dropout(0.3) -> Linear(8k->4k) -> ReLU
-Dropout(0.2) -> Linear(4k->2)
-k=16, TRAIN_IMG_SIZE=160, FocalLoss(gamma=1.5) + class_weights
-```
-
-**Training config (final):**
-- Optimizer: AdamW, lr=3e-4, weight_decay=1e-4
-- Batch: 64, eval_every_s=30, patience=8
-- Budget: BUDGET_S - rf_train_s - 45s safety = ~713s for CNN
-- Best checkpoint selected by holdout recall
+**Current CNN (runs 24-26) -- IN PROGRESS, may still change after the Planned Improvement Runs.**
+ResNet-SE, 2.84M params, 192px; the full architecture and training config are in "Run 24 Full
+Metrics" (runs 25-26 keep that architecture, changing only budget reserve, eval/selection and
+calibration target). The plain-CNN spec (runs 1-23) lives in the "Runs 22-23" section and the
+archived notebook old_02. Checkpoint selection is now holdout AUC with a guaranteed final eval
+(run 26); depth/width and resolution are still being decided (see "Planned Improvement Runs");
+the shipped choice gets pinned in "Key Decisions (shipped model)".
 
 ### Ensemble
 
-`p_ens = alpha * p_cnn + (1-alpha) * p_rf`
+`p_ens = alpha * p_cnn + (1-alpha) * p_rf`, alpha selected by AUC sweep on holdout.
 
-Alpha selected by AUC sweep on holdout (alpha in {0.3, 0.4, 0.5, 0.6, 0.7, 0.8}).
-Final runs: alpha=0.40 (CNN 40%, RF 60%).
+**IN PROGRESS -- leaning ENS, decided last.** The plain-CNN era (runs 7-23) used alpha=0.40;
+runs 24-26 used 0.50. On the reliable holdout (n=2970) the RF adds a steady +0.014/+0.010/+0.012
+AUC across runs 24/25/26 - it is not collapsing. Run-25's val crossover that briefly suggested
+CNN-only was a small-val artifact (Finding D). So the current lean is ENS, but it is not sealed:
+"CNN-only" has never been trained to the true full budget (Finding E), so the final CNN-only vs
+ENS call waits until idea 4, run on the winning architecture. See "Improvement Runs -- Tried",
+Findings D and E.
 
 ---
 
@@ -134,111 +130,140 @@ Final runs: alpha=0.40 (CNN 40%, RF 60%).
 | 21 | 5-conv+MLP | **160** | 16 | 1.5 | 0.18 | 0.746 | 0.207 | 0.650 | 0.117 | 0.795 | 0.176 | 0.878 | FAIL  |
 | 22 | 5-conv+MLP | 160 | 16 | 1.5 | 0.19 | 0.772 | 0.229 | 0.669 | 0.128 | **0.809** | **0.197** | 0.878 | **PASS** |
 | 23 | 5-conv+MLP | 160 | 16 | 1.5 | 0.19 | 0.724 | 0.197 | 0.669 | 0.128 | **0.811** | **0.170** | 0.888 | **PASS** |
+| 24 | **ResNet-SE** | **192** | 32-256 | 1.5 | 0.19 | 0.833 | 0.186 | 0.669 | 0.128 | **0.849** | **0.186** | **0.903** | **PASS** |
+| 25 | ResNet-SE | 192 | 32-256 | 1.5 | 0.19 | 0.859 | 0.218 | 0.669 | 0.128 | 0.879 | 0.207 | **0.914** | FAIL* |
+| 26 | ResNet-SE | 192 | 32-256 | 1.5 | 0.18 | 0.817 | 0.165 | 0.650 | 0.117 | **0.837** | **0.191** | **0.902** | **PASS** |
+
+Runs 24-26 are a different architecture family (see "Post-Run-23" section below); the `k` column lists their stage widths (32->64->128->256) rather than a single base channel count.
+
+*Run 25 FAIL is a calibration-margin artifact, not a model regression: the threshold hit the target on the calibration set (cal fpr 0.189 at target 0.19), and the val breach (fpr 0.207) is the cal->val sampling gap on ~400 val reals. Every discriminative metric beat run 24 (CNN holdout AUC 0.915 -> 0.919, ENS val AUC 0.903 -> 0.914, ENS val recall 0.849 -> 0.879). See "Improvement Runs -- Tried".
 
 ---
 
-## Run 22 Full Metrics (Final Model)
+## Runs 22-23: plain-CNN baseline (superseded by run 24)
 
-**CNN (160px, k=16, gamma=1.5):**
-| Split | recall_ai | fpr_real | AUC |
+Runs 22 and 23 are stochastic reruns of one recipe - 5-conv BN k=16, 160px, FocalLoss
+gamma=1.5, RF(n=400) ensemble at alpha=0.40, calibration target fpr 0.19. They flip PASS/FAIL
+on seed and threshold noise (run 22 ENS val 0.809 @ 0.197; run 23 ENS val 0.811 @ 0.170). Run 23
+is the baseline run 24 is measured against.
+
+**Run 23 (validation):**
+| model | recall_ai | fpr_real | AUC |
 |-------|-----------|----------|-----|
-| holdout | 0.730 | 0.158 | 0.877 |
-| cal | 0.755 | 0.177 | 0.868 |
-| val | 0.772 | 0.229 | 0.848 |
-| val_aug | 0.637 | 0.342 | 0.710 |
+| CNN | 0.724 | 0.197 | 0.850 (holdout AUC 0.879) |
+| RF | 0.669 | 0.128 | 0.854 |
+| ENS | **0.811** | **0.170** | **0.888** |
 
-**RF (RandomForest n=400, 101-dim features, thr=0.858):**
-| Split | recall_ai | fpr_real | AUC |
-|-------|-----------|----------|-----|
-| holdout | 0.667 | 0.091 | 0.885 |
-| cal | 0.690 | 0.177 | 0.851 |
-| val | 0.669 | 0.128 | 0.854 |
-| val_aug | 0.482 | 0.193 | 0.694 |
+Budget: RF ~18s + CNN ~715s = ~734s = 4.7x reference.
 
-**Ensemble (alpha=0.40, thr=0.627):**
-| Split | recall_ai | fpr_real | AUC |
-|-------|-----------|----------|-----|
-| holdout | 0.804 | 0.158 | 0.907 |
-| cal | 0.838 | 0.189 | 0.889 |
-| val | **0.809** | **0.197** | 0.878 |
-| val_aug | 0.653 | 0.326 | 0.719 |
+**Rationale (plain-CNN era; the capacity and ResBlock conclusions are revised in "Post-Run-23"):**
+- gamma=1.5 over 2.0: gamma=2.0 hit a higher single-run AUC (0.896, run 13) but swung recall
+  0.74-0.83 across seeds; 1.5 is stable. Retained in run 24.
+- 160px and k=16: best balance for that shallow net under budget; 224px and k=32 got too few
+  steps and underfit (runs 19-20). Both superseded by the run-24 redesign (192px, ResNet-SE).
+- Ensemble: CNN and RF make partly uncorrelated errors (pixel artifacts vs file/statistical
+  features), which lifted holdout AUC for the weak CNN. Run 24 narrowed that edge (CNN ~ ENS).
+- No SD3 upweighting: runs 8-11 pushed fpr to 0.23-0.25; reverted in run 12.
+- Calibration: pick_threshold_for_fpr on calibration reals at target 0.19 - data-driven, no
+  hardcoded threshold. Unchanged in run 24.
 
-Per-class recall on val (AI only): SD2.1=0.74, SDXL=0.96, SD3=0.64, DALL-E3=0.89, Midjourney=0.81
-
-Budget: RF=19.9s + CNN=713.6s = 733.5s total = 4.71x reference (limit: 5x)
+The early-run optimizer ablation (AdamW lr=3e-4 + class weights won) lived in the archived
+notebook 02 and is superseded by the run-24 warmup+cosine schedule.
 
 ---
 
-## Key Decisions and Rationale
+## Post-Run-23: Breaking the AUC Plateau (Capacity CNN)
 
-### Why Ensemble?
-CNN and RF make independent errors. CNN detects spatial/frequency artifacts in pixels.
-RF detects file-level and statistical properties (JPEG compression, spectral distribution,
-color statistics). Combining them raised ENS AUC from 0.877 (CNN alone) to 0.907 (ENS)
-on holdout, because errors are partially uncorrelated.
+Run 23 passed, but only barely and only by seed luck (runs 21-23 flip-flop PASS/FAIL on
+the same config). Rather than ship a borderline model, we asked a sharper question: what
+is actually capping performance, and is there a lever we have not pulled?
 
-### Why gamma=1.5 not 2.0?
-Focal loss gamma=2.0 sharpened focus on hard examples (SD3, ambiguous reals) and reached
-best single AUC (0.896 in run 13), but caused high variance between seeds — recall ranged
-0.740 to 0.827 across runs 13-17. gamma=1.5 is more stable and consistently passes.
+### Why the old CNN was not powerful enough -- AUC was the only real lever
 
-### Why 160px not 128px or 224px?
-- 128px: ~890 training steps but misses fine-grained artifacts
-- 224px: only ~350 steps (3x slower per step), model underfits — AUC 0.848 vs 0.877
-- 160px: ~930 steps (1.4x slower per step), best balance — AUC 0.877, calibration stable
+Look down the run table: across runs 7-23 we changed loss (CE -> focal, gamma 1.5 vs
+2.0), resolution (96/128/160/224), width (k=16 vs 32), depth (3/4/5 conv), architecture
+(plain, ResBlock, DW-sep), SD3 upweighting, and calibration target. Through all of it the
+ensemble AUC barely moved: holdout AUC stayed in 0.877-0.915, val AUC in 0.848-0.896.
 
-### Why k=16 not k=32?
-k=32 standard conv has 4x more parameters. At 128px it gets ~750 steps but converges
-too slowly for the budget — best AUC only 0.821 vs 0.877 for k=16. The dataset size
-(~27k training images) suits k=16 better; k=32 was still underfitting when time ran out.
+That matters because the metric we are graded on, recall_ai at fpr_real <= 0.20, is an
+operating point on the ROC curve, and the best achievable recall at a fixed fpr ceiling is
+bounded by the AUC. With the feature set and the threshold-calibration procedure fixed,
+threshold and loss tuning only slide the operating point along the same curve -- they trade
+recall for fpr, they do not raise the curve. So every "improvement" between runs that did
+not move AUC was just sliding along a fixed ROC, and the PASS/FAIL flips were threshold and
+seed variance, not real discriminative gains.
 
-### Why not ResBlock or DW-sep?
-- ResBlock (run 16): skip connections gave similar or worse AUC. The task relies on
-  hierarchical spatial patterns; residual shortcuts don't help here.
-- DW-sep (run 17): decouples depthwise spatial filtering from channel mixing. AI artifact
-  detection requires joint spatial+channel patterns, so DW-sep is a poor fit.
+Conclusion: the bottleneck was the model's discriminative ceiling (AUC), not the operating
+point. No amount of further loss or threshold tuning could break it. The only lever left
+was a genuinely more powerful model -- one that raises the ROC itself.
 
-### Why remove SD3 upweighting?
-SD3 upweighting (sd3_weight=2.0/3.0) in runs 8-11 pushed fpr to 0.234-0.250 on val.
-The upweighted model learned to classify ambiguous images as AI more aggressively, but
-this false positive rate violated the constraint. Reverted in run 12; SD3 remains the
-hardest class but is handled by focal loss.
+### Why the earlier ResBlock attempt (run 16) did not help
 
-### Calibration approach
-`pick_threshold_for_fpr(cal_reals_scores, target_fpr=0.19)` finds the minimum threshold t
-such that empirical fpr on calibration reals <= 0.19. This is data-driven and does not
-hardcode any specific threshold. The RF has a floor at thr~0.858 giving cal_fpr~0.177
-regardless of target; the ENS calibration target 0.19 gives cal_fpr=0.189.
+It is fair to ask: we already tried a residual architecture in run 16 and it was worse, so
+why expect residuals to help now? Two reasons run 16 was not a real test of capacity:
+
+1. It was run at gamma=2.0, the high-variance loss setting. Runs 15-17 all suffered that
+   instability (recall swung 0.72-0.83 across seeds), so the ResBlock comparison was
+   confounded by a bad loss setting, not a clean architecture test.
+2. More fundamentally, residual connections exist to fix gradient flow in *deep* networks
+   (tens of layers). Bolting one or two skip connections onto a 5-conv net adds no capacity
+   and solves a problem it never had -- vanishing gradients were not the bottleneck at depth
+   5. Run 16 also kept the same compute layout (no early downsampling, 3 convs running at
+   40x40), so it had the same low parameter count as the plain net. It was a cosmetic change.
+
+Width scaling (k=32, run 20) was the other obvious capacity knob, and it failed too -- but
+for a different reason: 4x the parameters made each step ~3x slower, so it got too few steps
+and was still underfitting when the budget ran out (AUC 0.876).
+
+### The new approach and why it should work given everything above
+
+Diagnosis of the old net's compute allocation: it stops downsampling after two MaxPools, so
+its three deepest convs run at 40x40 and 56% of its 424M MACs/img sit in a single 128->128
+conv. It is FLOPs-heavy but parameter-poor (~250k params). It spends the budget on spatial
+resolution it cannot exploit instead of on capacity -- which is exactly why both "more time"
+(script runs) and "more width" (k=32) failed.
+
+Redesign (ResNet-style, run 24):
+- Stem conv 3x3 stride-2 + MaxPool2 downsamples to stride-4 immediately, so the expensive
+  stages run at low resolution.
+- Four residual stages widening 32 -> 64 -> 128 -> 256, two BasicBlocks each, with
+  squeeze-excitation channel attention (near-free on CPU).
+- GAP -> Dropout -> Linear head. 192px input.
+
+This gives 2.84M parameters (11x the old net) at 319M MACs/img (0.75x the old net) -- more
+capacity at less compute. It fits ~1700 steps in the same budget and affords 192px instead
+of 160px. Now the residual blocks serve their real purpose: the net is 17 convs deep, deep
+enough that skip connections genuinely aid stable training. We also added a warmup + cosine
+LR schedule, which the constant-LR runs never had.
+
+This is the first change since run 7 that moved AUC: CNN holdout AUC 0.879 -> 0.915, ENS
+holdout AUC 0.915 -> 0.929, ENS val AUC 0.888 -> 0.903. And critically, the holdout AUC was
+still climbing at the budget deadline (best checkpoint at step 1450 of 1491), whereas run 23
+plateaued and early-stopped -- direct evidence the extra capacity is being used, not wasted.
 
 ---
 
-## Ablation Results (60s each, early runs)
+## Run 24 Full Metrics (Capacity CNN -- last clean PASS)
 
-| Config | Holdout recall | Holdout fpr | Notes |
-|--------|---------------|-------------|-------|
-| Adam lr=1e-4, no class weight | - | - | baseline |
-| Adam lr=1e-4, class weight | - | - | +recall |
-| AdamW lr=3e-4, class weight | - | - | best |
-| SGD lr=1e-2, class weight | - | - | slower convergence |
+Run 24 is the last run that passed the operating point cleanly on validation (recall 0.849 @ fpr
+0.186). Run 25 (see "Improvement Runs -- Tried") has a strictly higher ROC (ENS val AUC 0.914 vs
+0.903) but breached the val fpr ceiling on a too-tight 0.19 calibration target; it becomes the
+model direction once recalibrated at 0.18. The full architecture/training spec below still
+applies to run 25 (only the budget reserve changed, 70s -> 45s).
 
-(Full ablation outputs available in notebook cell bad4d29a)
+Architecture: ResNet-SE. Stem conv3x3 s2 + MaxPool2; 4 stages [2,2,2,2] BasicBlock+SE,
+widths 32/64/128/256; GAP -> Dropout(0.2) -> Linear. 2.84M params, 319M MACs/img at 192px,
+channels_last. Training: AdamW peak_lr=1e-3 wd=1e-4, warmup+cosine schedule, FocalLoss
+gamma=1.5 + class weights, batch 64, 192px. Trained 1491 steps (3.6 epochs) in ~708s; best
+holdout checkpoint at step 1450/1491. RF and ensemble recipe unchanged from run 23.
 
----
-
-## Run 23 Full Metrics (same config as run 22 -- stochastic rerun)
-
-Config: identical to run 22 (5-conv BN k=16 160px gamma=1.5, RF n=400, ENS tgt=0.19).
-Difference from run 22: benchmark cell (feat_fast_bench) ran before CNN training, shifting
-the RNG state. Result is within noise of run 22 -- this is seed variance, not a real improvement.
-Best this run: ENS AUC=0.888 (highest seen), fpr=0.170 (more headroom than run 23's 0.197).
-
-**CNN (160px, k=16, gamma=1.5):**
+**CNN (ResNet-SE, 192px, thr=0.413):**
 | Split | recall_ai | fpr_real | AUC |
 |-------|-----------|----------|-----|
-| holdout | 0.724 | 0.135 | 0.879 |
-| cal | 0.743 | 0.189 | 0.863 |
-| val | 0.724 | 0.197 | 0.850 |
-| val_aug | 0.558 | 0.225 | 0.728 |
+| holdout | 0.824 | 0.168 | 0.915 |
+| cal | 0.837 | 0.189 | 0.906 |
+| val | 0.833 | 0.186 | 0.889 |
+| val_aug | 0.693 | 0.305 | 0.786 |
 
 **RF (RandomForest n=400, 101-dim features, thr=0.853):**
 | Split | recall_ai | fpr_real | AUC |
@@ -248,73 +273,193 @@ Best this run: ENS AUC=0.888 (highest seen), fpr=0.170 (more headroom than run 2
 | val | 0.669 | 0.128 | 0.854 |
 | val_aug | 0.501 | 0.203 | 0.694 |
 
-**Ensemble (alpha=0.40, thr=0.677):**
+**Ensemble (alpha=0.50, thr=0.604):**
 | Split | recall_ai | fpr_real | AUC |
 |-------|-----------|----------|-----|
-| holdout | 0.792 | 0.121 | 0.915 |
-| cal | 0.829 | 0.189 | 0.893 |
-| val | **0.811** | **0.170** | 0.888 |
-| val_aug | 0.604 | 0.289 | 0.734 |
+| holdout | 0.851 | 0.162 | 0.929 |
+| cal | 0.868 | 0.189 | 0.914 |
+| val | **0.849** | **0.186** | **0.903** |
+| val_aug | 0.699 | 0.294 | 0.780 |
 
-Per-class recall on val (AI only): SD2.1=0.78, SDXL=0.95, SD3=0.63, DALL-E3=0.90, Midjourney=0.80
-Budget: RF=18.4s + CNN=715.2s = 733.6s total = 4.71x reference
+Per-class recall on val (ENS, AI only): SD2.1=0.80, SDXL=0.93, SD3=0.74, DALL-E3=0.95, Midjourney=0.83
+Budget: RF~11s + CNN~708s = ~719s total = 4.6x reference (limit: 5x)
+
+Notable shifts vs run 23: the CNN alone (val AUC 0.889, recall 0.833 @ fpr 0.186) now
+matches what the run-23 *ensemble* achieved, and the ensemble alpha moved 0.40 -> 0.50
+(the CNN is now strong enough to carry equal weight with the RF). SD3, the historically
+hardest class, jumped from 0.63 to 0.74 recall.
 
 ---
 
-## Script Pipeline Results (solution/ scripts)
+## Improvement Runs -- Tried
 
-**Budget comparison -- critical context:**
-The script pipeline is NOT bounded by the 5x reference time constraint used in notebook
-development. Scripts use `timeout_seconds` directly:
-- Notebook budget: `BUDGET_S = 5 * 155.6s = 778s` total (RF + CNN + overhead)
-- Script CNN budget: `1800 - 90s overhead = 1710s`
+Each idea gets ONE run, documented here; the best is shipped. Ideas 1-2 are done (runs 25-26);
+the rest are under "Improvement Runs -- Planned".
 
-This means script runs are not directly comparable to notebook run entries.
+### Idea 1 -- Full CNN budget + CNN-only vs ENS (run 25)
 
-**Script run 1 (1778.5s total, 2334 steps):**
+**Motivation (the run-24 observation).** The run-24 CNN alone (val 0.833 @ 0.186, AUC 0.889)
+nearly equalled the full ensemble (val 0.849 @ 0.186, AUC 0.903): the ensemble added only ~0.015
+val AUC, versus ~0.04 in the k=16 era (CNN 0.850 -> ENS 0.888). At the same time the holdout AUC
+was still rising at the deadline (best step 1450/1491). Together these said the CNN, not the
+ensemble, was now the engine, and it was undertrained, not saturated - so spending budget on the
+RF while the CNN trained less may be a net loss, and CNN-only might beat ENS once the CNN got the
+full budget. The run trims the CNN-budget reserve from 70s to 45s (the reserve only has to cover
+the in-budget post-CNN work - RF refit + calibration + save - plus slower-grader safety), giving
+the CNN ~32s more (708s -> 740s), and compares CNN-only against ENS at that budget.
 
-RF 17.6s + CNN 1691s budget. Best holdout recall=0.887.
+**Run 25 results.** Trace: 1598 steps in 740s (3.8 epochs), best checkpoint at the LAST step
+(1598/1598) - still climbing, no plateau (run 24 was 1450/1491 at 708s). Every discriminative
+metric improved.
 
-| Model | Split | recall_ai | fpr_real | AUC |
-|-------|-------|-----------|----------|-----|
-| CNN | val | 0.732 | 0.207 | 0.849 |
-| ENS | val | 0.795 | 0.181 | 0.894 |
+| model | thr | holdout AUC | val recall | val fpr | val AUC | val_aug rec/fpr/AUC |
+|-------|-----|-------------|-----------|---------|---------|---------------------|
+| CNN | 0.348 | 0.919 | 0.859 | 0.218 | 0.908 | 0.763 / 0.374 / 0.771 |
+| RF | 0.853 | 0.885 | 0.669 | 0.128 | 0.854 | 0.501 / 0.203 / 0.694 |
+| ENS (alpha 0.50) | 0.567 | 0.929 | 0.879 | 0.207 | 0.914 | 0.769 / 0.396 / 0.767 |
 
-ENS val=0.795 -> FAIL. Threshold thr=0.691 was more conservative than notebook runs
-(~0.627-0.677), leaving fpr headroom while missing recall. Seed variance.
+Budget: CNN 739.8s + RF 9.8s = 749.6s = 4.82x reference (CNN-only 4.75x). Within 5x with margin.
 
-**Script run 2 (1426.7s total, 1915 steps, early stop):**
+**Finding A - calibration margin too tight (target 0.19).** The threshold hit the target on the
+calibration set (cal fpr 0.189 for both CNN and ENS), but the cal->val sampling gap on ~400 val
+reals pushed val fpr to 0.207-0.218, over the 0.20 ceiling. This is why run 25 is marked FAIL in
+the table - a calibration artifact, not a worse model. 0.19 leaves no headroom for the gap. The
+fix carries to the next run: calibrate at target 0.18 (~0.02 headroom). Recall barely moves at a
+slightly tighter threshold because the ROC is steep there (holdout recall is already 0.877 at fpr
+0.174). Run 25 itself is reported at 0.19 - we do not relabel it.
 
-RF 18.7s + CNN 1690s budget. Best holdout recall=0.856. Early stopping triggered after
-patience=8 evals without improvement (best checkpoint at step 1448).
+**Finding B - the RF margin is collapsing; lean toward CNN-only (MAJOR).** On validation the
+longer-trained CNN alone (AUC 0.908) now exceeds the *previous* run-24 ensemble (0.903), and the
+RF's marginal val AUC fell from +0.014 (run 24: CNN 0.889 -> ENS 0.903) to +0.006 (run 25: 0.908
+-> 0.914). The original "ensemble is smart" assumption was correct only while the CNN was weak:
+the RF made partly uncorrelated errors that lifted a low ROC. Now the CNN's ROC is high enough
+that the RF mostly rides along. Honest caveat: on the larger, less-noisy holdout (n=2970) the
+ensemble still leads (CNN 0.919 vs ENS 0.929, RF margin +0.010, also shrinking from +0.014), and
+the RF is the low-fpr branch (val fpr 0.128) that tightens the operating point. So the val
+crossover is partly noise - the durable signal is the shrinking RF margin plus the still-climbing
+CNN, not a clean "CNN beat ENS". Budget-wise, dropping the RF returns ~10s to the CNN, which at
+the current marginal rate buys back roughly the AUC the RF added - so CNN-only is about a wash on
+score and wins on simplicity and on putting all budget into the part that is still improving. A
+strong lean toward shipping CNN-only, confirmed (not sealed) in idea 2, judged on holdout.
+**Revised by run 26 (Finding D): this lean does not hold up - the +0.006 was a noisy-val
+artifact, and CNN-only has never actually been given the full budget (see Finding E).**
 
-| Model | Split | recall_ai | fpr_real | AUC |
-|-------|-------|-----------|----------|-----|
-| CNN | holdout | 0.761 | 0.121 | 0.900 |
-| CNN | cal | 0.766 | 0.189 | 0.872 |
-| CNN | val | 0.766 | 0.191 | 0.868 |
-| CNN | va | 0.702 | 0.348 | 0.741 |
-| RF | val | 0.715 | 0.170 | 0.852 |
-| ENS | holdout | 0.804 | 0.127 | 0.923 |
-| ENS | cal | 0.836 | 0.189 | 0.898 |
-| ENS | val | **0.812** | **0.165** | **0.894** |
-| ENS | va | 0.685 | 0.374 | 0.744 |
+### Idea 2 -- Reproducible step-based eval + AUC selection + 0.18 calibration (run 26)
 
-ENS val=0.812 -> PASS. alpha=0.40, thr=0.677. Consistent with notebook development
-runs 22/23 (0.809-0.811). Run 1 failure is seed variance, same as run 21.
+**What changed.** Step-based, tail-weighted eval (16 evals, dense in the last ~25%) plus a
+guaranteed final eval of the last weights; checkpoint selected by holdout AUC (not recall@fpr);
+calibration target 0.19 -> 0.18 (Finding A). Architecture, loss, LR and budget unchanged.
+
+**Run 26 results.** Trace: 1607 steps in 743s, best holdout AUC at the last step (1607/1607),
+final eval 8.1s. First clean PASS since run 24.
+
+| model | thr | holdout AUC | val recall | val fpr | val AUC | val_aug rec/fpr/AUC |
+|-------|-----|-------------|-----------|---------|---------|---------------------|
+| CNN | 0.406 | 0.916 | 0.817 | 0.165 | 0.888 | 0.725 / 0.353 / 0.774 |
+| RF | 0.858 | 0.885 | 0.650 | 0.117 | 0.854 | 0.501 / 0.203 / 0.694 |
+| ENS (alpha 0.50) | 0.605 | 0.928 | 0.837 | 0.191 | 0.902 | 0.726 / 0.348 / 0.771 |
+
+Budget: CNN 743.5s (incl. 8.1s final eval) + RF 11.3s = 754.8s = 4.85x; post-CNN work 19.4s, well
+under the 45s reserve. Both candidates pass the operating point at target 0.18 (CNN-only 0.817 @
+0.165, ENS 0.837 @ 0.191). The budget assert holds with ~23s of headroom under 5x.
+
+**Finding C - idea 2 buys stability, not AUC.** Holdout AUC is unchanged within noise vs run 25
+(CNN 0.919 -> 0.916, ENS 0.929 -> 0.928); the model is plateaued at this capacity across runs
+24-26. What idea 2 delivered is reproducible, threshold-independent selection and a clean,
+in-budget operating point at 0.18 - the first clean PASS since run 24. The guaranteed final eval
+did not change the pick (the endpoint won selection in every run) and cannot lower quality; it
+only prevents shipping a stale checkpoint.
+
+**Finding D - the RF-margin "collapse" (Finding B) was noise; ENS is the current pick.** The
+holdout ENS-over-CNN AUC margin across runs is +0.014 (24), +0.010 (25), +0.012 (26): the RF
+reliably adds ~0.01-0.014 on the n=2970 set. Run-25's val margin of +0.006 that prompted the
+CNN-only lean was a small-val artifact (that run's CNN scored unusually high on val, n~188). The
+apparent recall "dropoff" (ENS val recall 0.879 run 25 -> 0.837 run 26) is likewise not a
+regression: run-25's 0.879 sat at an illegal fpr (0.207 > 0.20 = FAIL); at a legal operating point
+it is the same ROC (holdout AUC 0.928 across 24-26). run 26 sits at 0.837 @ 0.191 with ~0.009 fpr
+headroom; calibrating slightly looser (target ~0.185 -> val ~0.196) would reclaim ~0.01 recall if
+we want to push. Corrected conclusion: keep ENS. CNN-only stays a viable simpler fallback (it also
+passes), but the decision is deferred (Finding E).
+
+**Finding E - CNN-only has been handicapped; the fair test comes last.** In every run so far the
+CNN trains to `BUDGET_S - 45s` because the 45s reserve is held for the RF. "CNN-only" was then
+read off that same RF-reserved CNN, i.e. trained to 5x minus the RF's reserve, ~30s short of its
+real budget. So we have never measured a true max-budget CNN-only. Given the plateau (+30s buys
+~0.004 holdout AUC) versus the RF's +0.012, ENS very likely still wins, but the comparison as run
+is biased toward ENS. The clean test (train the CNN to the full 5x with only a final-eval/save
+reserve, then compare to the best ENS) is deferred to after the architecture is settled - see
+"Improvement Runs -- Planned".
+
+---
+
+## Improvement Runs -- Planned
+
+Each idea below gets ONE run, moved to "Tried" once executed; the best is shipped. Order: idea 3
+next (settle the architecture), then idea 4 (final CNN-only vs ENS on that architecture).
+
+3. **Depth/width A-B (NEXT).** The model is plateaued at holdout AUC ~0.916 CNN / ~0.928 ENS
+   across runs 24-26, so capacity (not time, not resolution) is the only remaining AUC lever - and
+   even here expect modest movement. Run it one-variable-at-a-time from the run-26 baseline, NOT a
+   grid, and stop early:
+   - *Variant 3a (first):* `CNN_BLOCKS = (2,2,2,3)` - a 3rd BasicBlock in stage 4 (deepest, runs at
+     6x6 @192px so extra params are cheap in MACs). 2.84M -> 4.04M params, 348M -> 390M MACs/img
+     (+12%). It costs ~12% throughput, so it trains ~1,430 steps vs run-26's 1,607 in the same
+     budget - the test is precisely whether the added capacity outweighs the lost steps within 5x.
+   - *Decision gate:* compare holdout AUC (the reliable n=2970 metric) vs run 26 (CNN 0.916 /
+     ENS 0.928). If it does not beat run 26 by more than noise (~0.003), capacity at the top is
+     tapped out - stop and keep run 26. If it moves, that variant becomes the architecture and we
+     try one more (stage-4 width 320). Resolution (176 vs 192) is not its own run: runs 25-26
+     already showed more steps do not help (plateau), so 176's only edge (more steps) is moot -
+     only revisit if a capacity bump makes 192px drop below ~1,600 benchmarked steps.
+   - Whatever wins (or run 26, if nothing beats it) becomes the architecture for idea 4.
+
+4. **Full CNN train time + final CNN-only vs ENS (LAST, on the winning architecture).** Settles
+   whether we ship CNN-only or ENS, fairly. Reason (Finding E): every run so far trained the CNN
+   to `BUDGET_S - 45s` because the 45s reserve is held for the RF, so "CNN-only" was always ~30s
+   short of its real budget - we have never measured a true max-budget CNN-only. Here, on the
+   architecture idea 3 picks, run the CNN to the full 5x with only a final-eval/save reserve
+   (`CNN_BUDGET_RESERVE_S ~15`, no RF reserve, CNN ~763s) to get the genuine max CNN-only, and
+   compare its holdout AUC to the best ENS (run 26 ENS, or idea-3's ENS if better). If max
+   CNN-only still trails the ENS (expected, given the plateau: +30s ~+0.004 AUC vs the RF's
+   +0.012), ship ENS; if it catches up, ship CNN-only (simpler). Doing this last avoids re-running
+   it for every architecture variant - we only need the CNN-vs-ENS call on the final model.
+
+**Will not retry (no improvement in runs 1-23, evidence in the run table above):** gamma=2.0
+focal (high seed variance, runs 13-17), depthwise-separable convs (run 17 worse), SD3
+upweighting (pushed fpr > 0.20, runs 8-11), 224px and k=32-from-scratch (too few steps,
+underfit, runs 19-20), and large width/parameter scaling (overfit risk at ~27k images).
+
+---
+
+## Key Decisions and Rationale (shipped model) -- TO FILL
+
+Placeholder. Fill once the planned improvement runs settle the model we ship for Task 1.2.
+Capture only the decisions that define THAT model, each with a a short "why" grounded in the
+run that decided it:
+- Architecture (ResNet-SE widths/blocks/SE) and input resolution.
+- CNN-only vs ensemble (does the RF still add AUC?), and alpha if ensembled. (!NOTE TO LLM WHEN WRITING THIS: DECISION TO EVEN THINK OF AN ENS IS NOT TRIVIAL -> TELL HOW COMBINING these 2 MODELS CAN RESULT IN BETTER PERFROMACNE WHEN CONBINED VS WHEN USED STANDALONE & THIS WAS AN OBVIOUS DECISION EARLY ON WHEN CNN WAS BAD AND ENS ALWAYS SIGNIFICANTLY BETTER)
+- LR schedule (warmup+cosine, peak).
+- Checkpoint-selection metric (AUC vs recall@fpr) and whether snapshot averaging is used.
+- Calibration target and the realised val operating point.
+
+Until then the live rationale lives in "Post-Run-23" (why the capacity redesign) and
+"Planned Improvement Runs" (what is still being decided).
 
 ---
 
 ## What Remains for Task 1.3
 
 Task 1.3 requires robustness to distortions (blur, compression, resize) using
-data/calibration_augmented/ and data/validation_augmented/.
+data/calibration_augmented/ and data/validation_augmented/. Whatever 1.2 model we settle on
+(after the planned improvement runs above) is the starting point - 1.3 is not tackled here.
 
-Current model (run 23) on val_aug:
-- ENS val_aug recall=0.653, fpr=0.326 — fpr 3x higher than clean val
-- CNN val_aug fpr=0.342 — augmented real images score like AI
-- RF val_aug fpr=0.193 — RF more robust (hand-crafted features less sensitive to pixel distortion)
+The core 1.3 problem shows up consistently across the 1.2 runs: on val_aug the false-positive
+rate runs far above the clean-val fpr (roughly 0.29-0.34 vs ~0.17-0.20), because augmented real
+images get smoothed/recompressed and start scoring like AI. The RF is the more robust branch
+(val_aug fpr ~0.19-0.20 vs the CNN's ~0.30+), since hand-crafted features are less sensitive to
+pixel-level distortion. Recall on val_aug is not the blocker - it clears the >=0.60 target in
+recent runs; the false-positive rate is.
 
 Task 1.3 target: recall_ai >= 0.60 on val_aug while fpr <= 0.20.
-Current recall=0.653 already meets the recall target but fpr=0.326 violates the constraint.
-Main work: reduce false positives on augmented real images.
+Main work: reduce false positives on augmented real images - augmentation-aware training and
+calibration on calibration_augmented - without giving back the clean-val operating point.

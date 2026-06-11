@@ -127,7 +127,10 @@ trains until a wall-clock deadline and saves the best checkpoint by holdout reca
 After training, the operating threshold is selected automatically using only
 `data/calibration/`. The function `pick_threshold_for_fpr` finds the smallest threshold
 t such that the empirical false-positive rate on calibration real-class images is at
-most 0.19. No validation data is used at any point during threshold selection. For the
+most 0.19. We target 0.19 rather than the full 0.20 budget on purpose: it leaves a small
+safety margin so the operating point still satisfies the 0.20 constraint when it
+generalises to the unseen evaluation holdout, where the realised FPR can drift above the
+calibration estimate. No validation data is used at any point during threshold selection. For the
 ensemble, the CNN-to-RF weighting (alpha=0.40) is first selected by AUC sweep on a
 held-out training fold, then `pick_threshold_for_fpr` is applied to the combined
 ensemble scores on the calibration split.
