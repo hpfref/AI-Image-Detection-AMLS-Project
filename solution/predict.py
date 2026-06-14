@@ -35,7 +35,7 @@ from _lib import io as _io
 from _lib import seed as _seed
 from _lib.calibration import read_threshold_json
 from _lib.features import features_single
-from _lib.model import build_cnn_bn
+from _lib.model import build_capacity_cnn
 
 
 def main() -> int:
@@ -61,9 +61,16 @@ def main() -> int:
 
     import joblib
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-    cnn  = build_cnn_bn(k=ckpt["k"])
+    arch = ckpt.get("arch", "capacity_v1")
+    if arch != "capacity_v1":
+        print(f"ERROR: unsupported checkpoint arch {arch!r}", file=sys.stderr)
+        return 1
+    cnn = build_capacity_cnn(widths=tuple(ckpt["widths"]), blocks=tuple(ckpt["blocks"]))
     cnn.load_state_dict(ckpt["state"])
     cnn.eval()
+    channels_last = bool(ckpt.get("channels_last", False))
+    if channels_last:
+        cnn = cnn.to(memory_format=torch.channels_last)
     mean = ckpt["mean"]  # (3,) float32
     std  = ckpt["std"]   # (3,) float32
     img_size = ckpt["img_size"]
@@ -100,6 +107,8 @@ def main() -> int:
         t = torch.from_numpy(arr_norm).permute(2, 0, 1).unsqueeze(0)  # (1, 3, 224, 224)
         if t.shape[-1] != img_size:
             t = F.interpolate(t, size=img_size, mode="bilinear", align_corners=False)
+        if channels_last:
+            t = t.contiguous(memory_format=torch.channels_last)
         with torch.no_grad():
             p_cnn = float(torch.softmax(cnn(t), dim=1)[0, 1])
 

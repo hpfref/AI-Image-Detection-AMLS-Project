@@ -1,22 +1,25 @@
 """
 Task 1.2 -- Modeling and Tuning under Time Constraints  (35/100 points)
 
-Reads:    artifacts/prepared/          (features from prepare.py)
-Writes:   artifacts/task02/best.pt         -- CNN state dict + config
-          artifacts/task02/rf_model.pkl    -- winning classical model
-          artifacts/task02/threshold.json  -- ensemble threshold + alpha
+Reads:    artifacts/prepared/               (features + image caches from prepare.py)
+Writes:   artifacts/task02/best.pt          -- CNN state dict + arch config
+          artifacts/task02/rf_model.pkl     -- RandomForest (classical family)
+          artifacts/task02/threshold.json   -- ensemble threshold + alpha
 
-Goals (PDF §1.2):
-    - Maximize recall_ai under fpr_real <= 0.20.
-    - Calibrate threshold AUTOMATICALLY on data/calibration/ -- no manual values.
-    - Report at least TWO model families (classical baseline + neural).
-    - CPU only, no internet, no pretrained downloads at runtime.
-    - Training time bounded by timeout_seconds CLI argument.
+Shipped model (notebooks/task12_experiment_log.md "Key Decisions"):
+    ResNet-SE capacity CNN (build_capacity_cnn, 192px, warmup+cosine LR, checkpoint
+    chosen by holdout AUC) ensembled with a RandomForest(400) on 101-dim engineered
+    features: p_ens = alpha*p_cnn + (1-alpha)*p_rf, alpha by holdout AUC sweep.
+    Threshold calibrated automatically on data/calibration/ at target FPR 0.18.
 
 Budget design:
-    deadline = start + timeout_seconds - SAFETY_S
-    SAFETY_S = 90s covers RF training (~45s on grader) + calibration scoring
-    (~20s) + save (~5s) + 20s buffer. CNN gets the rest (~1710s on our machine).
+    The grader hard-kills each script at --timeout_seconds. We train the CNN to
+    (start + timeout - OVERHEAD_S) and reserve OVERHEAD_S for the in-budget post-CNN
+    work that MUST finish so we can ship: the guaranteed final eval + RF refit +
+    calibration + saving the 3 artifacts. OVERHEAD_S=120 covers that even on a
+    ~3x-slower grader. The best CNN checkpoint is also written incrementally during
+    training (PDF advice), and the optional all-split metric printing is time-guarded
+    so documentation can never delay shipping.
 
 CLI:
     python train.py --timeout_seconds 1800
@@ -37,17 +40,20 @@ import torch
 from _lib import io as _io
 from _lib import seed as _seed
 from _lib.calibration import pick_threshold_for_fpr, write_threshold_json
-from _lib.model import build_cnn_bn, cnn_scores, train_cnn
+from _lib.model import build_capacity_cnn, cnn_scores, train_capacity
 
-# Hyperparameters matching run 23 (pass: recall=0.809, fpr=0.197)
-CNN_K        = 16
-IMG_TRAIN    = 160
-ENS_TARGET   = 0.19   # calibration FPR target for ensemble threshold
-SAFETY_S     = 90     # post-training overhead budget (see docstring)
+# Shipped architecture / training config (run 29)
+WIDTHS        = (32, 64, 128, 256)
+BLOCKS        = (2, 2, 2, 2)
+TRAIN_IMG     = 192
+CHANNELS_LAST = True
+ENS_TARGET    = 0.18    # calibration FPR target (kept at 0.18; see log Finding F)
+OVERHEAD_S    = 60      # post-CNN reserve: final eval + 1 calibration pass + save (RF is done pre-CNN)
+METRIC_SAFETY = 20      # stop optional metric eval this many seconds before the timeout
 
 
 # ---------------------------------------------------------------------------
-# Data loading helpers
+# Data loading
 # ---------------------------------------------------------------------------
 
 def _load_split(out_dir, name: str):
@@ -62,82 +68,8 @@ def _load_split(out_dir, name: str):
     return X, y, src, F
 
 
-# ---------------------------------------------------------------------------
-# Classical baseline: LR vs RF, winner selected by holdout recall
-# ---------------------------------------------------------------------------
-
-def train_classical(F_fit, y_fit, F_hold, y_hold):
-    """Train LR (C grid) and RF (n_estimators grid); return (winner, elapsed_s)."""
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
-
-    t0 = time.monotonic()
-    print("training classical models...")
-
-    best_lr = {"recall": -1.0, "pipe": None, "label": ""}
-    for C in (0.1, 1.0, 10.0):
-        pipe = Pipeline([
-            ("scale", StandardScaler()),
-            ("lr",    LogisticRegression(class_weight="balanced", max_iter=2000, C=C)),
-        ])
-        pipe.fit(F_fit, y_fit)
-        p = pipe.predict_proba(F_hold)[:, 1]
-        thr = pick_threshold_for_fpr(p[y_hold == 0], target_fpr=0.18)
-        rec = float(((p >= thr) & (y_hold == 1)).sum() / max(int((y_hold == 1).sum()), 1))
-        print(f"  LR C={C:>5}: holdout recall={rec:.3f}")
-        if rec > best_lr["recall"]:
-            best_lr = {"recall": rec, "pipe": pipe, "label": f"LR C={C}"}
-
-    best_rf = {"recall": -1.0, "pipe": None, "label": ""}
-    for n_est in (200, 400):
-        rf = RandomForestClassifier(
-            n_estimators=n_est, n_jobs=-1, random_state=0,
-            class_weight="balanced", max_features="sqrt",
-        )
-        rf.fit(F_fit, y_fit)
-        p = rf.predict_proba(F_hold)[:, 1]
-        thr = pick_threshold_for_fpr(p[y_hold == 0], target_fpr=0.18)
-        rec = float(((p >= thr) & (y_hold == 1)).sum() / max(int((y_hold == 1).sum()), 1))
-        print(f"  RF n={n_est:>4}: holdout recall={rec:.3f}")
-        if rec > best_rf["recall"]:
-            best_rf = {"recall": rec, "pipe": rf, "label": f"RF n={n_est}"}
-
-    if best_rf["recall"] >= best_lr["recall"]:
-        print(f"  winner: {best_rf['label']} (recall={best_rf['recall']:.3f})")
-        winner = best_rf["pipe"]
-    else:
-        print(f"  winner: {best_lr['label']} (recall={best_lr['recall']:.3f})")
-        winner = best_lr["pipe"]
-
-    elapsed = time.monotonic() - t0
-    print(f"  classical training: {elapsed:.1f}s")
-    return winner, elapsed
-
-
-# ---------------------------------------------------------------------------
-# Ensemble alpha selection (by holdout AUC)
-# ---------------------------------------------------------------------------
-
-def select_alpha(p_cnn, p_rf, y):
-    from sklearn.metrics import roc_auc_score
-    best_alpha, best_auc = 0.5, -1.0
-    for alpha in (0.3, 0.4, 0.5, 0.6, 0.7, 0.8):
-        p_ens = alpha * p_cnn + (1 - alpha) * p_rf
-        auc = float(roc_auc_score(y, p_ens))
-        if auc > best_auc:
-            best_auc = auc
-            best_alpha = alpha
-    print(f"  alpha={best_alpha}  holdout ENS AUC={best_auc:.4f}")
-    return best_alpha
-
-
-# ---------------------------------------------------------------------------
-# Metrics printer
-# ---------------------------------------------------------------------------
-
 def _print_metrics(tag, y_true, scores, thr):
+    from sklearn.metrics import roc_auc_score
     y_pred = (scores >= thr).astype(int)
     tp = int(((y_pred == 1) & (y_true == 1)).sum())
     fn = int(((y_pred == 0) & (y_true == 1)).sum())
@@ -145,11 +77,9 @@ def _print_metrics(tag, y_true, scores, thr):
     tn = int(((y_pred == 0) & (y_true == 0)).sum())
     rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-    from sklearn.metrics import roc_auc_score
     auc = float(roc_auc_score(y_true, scores)) if len(np.unique(y_true)) > 1 else float("nan")
     print(f"  [{tag}] recall_ai={rec:.3f}  fpr_real={fpr:.3f}  auc={auc:.3f}  "
-          f"thr={thr:.4f}  tp={tp}  fn={fn}  fp={fp}  tn={tn}")
-    return rec, fpr
+          f"thr={thr:.4f}  tp={tp}  fn={fn}  fp={fp}  tn={tn}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +91,7 @@ def main() -> int:
     parser.add_argument("--timeout_seconds", type=int, required=True)
     args = parser.parse_args()
     _start = time.monotonic()
+    hard_deadline = _start + args.timeout_seconds
 
     _seed.set_deterministic(0)
     prep_dir = _io.ARTIFACTS_ROOT / "prepared"
@@ -173,7 +104,7 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Step 1: load prepared arrays
     # ------------------------------------------------------------------
-    print("loading prepared splits...")
+    print("loading prepared splits...", flush=True)
     X_fit,  y_fit,  src_fit,  F_fit  = _load_split(prep_dir, "fit")
     X_hold, y_hold, src_hold, F_hold = _load_split(prep_dir, "hold")
     X_cal,  y_cal,  src_cal,  F_cal  = _load_split(prep_dir, "cal")
@@ -182,109 +113,115 @@ def main() -> int:
     mean = np.load(str(prep_dir / "mean.npy"))
     std  = np.load(str(prep_dir / "std.npy"))
     print(f"  fit={len(X_fit)}  hold={len(X_hold)}  cal={len(X_cal)}  "
-          f"val={len(X_val)}  va={len(X_va)}")
+          f"val={len(X_val)}  va={len(X_va)}", flush=True)
 
     # ------------------------------------------------------------------
-    # Step 2: classical model (RF + LR comparison)
+    # Step 2: RandomForest FIRST -- deterministic, ~10s; save it immediately so the
+    # classical model can never be lost, and keep it out of the post-CNN reserve.
     # ------------------------------------------------------------------
-    classical_pipe, rf_elapsed = train_classical(F_fit, y_fit, F_hold, y_hold)
+    import joblib
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.metrics import roc_auc_score
+
+    rf_t0 = time.monotonic()
+    rf = RandomForestClassifier(n_estimators=400, n_jobs=-1, random_state=0,
+                                class_weight="balanced", max_features="sqrt")
+    rf.fit(F_fit, y_fit)
+    joblib.dump(rf, str(out_dir / "rf_model.pkl"))
+    p_rf_hold = rf.predict_proba(F_hold)[:, 1]
+    p_rf_cal  = rf.predict_proba(F_cal)[:, 1]
+    print(f"RF trained + saved in {time.monotonic() - rf_t0:.1f}s  "
+          f"(pre-CNN, off the post-train reserve)", flush=True)
 
     # ------------------------------------------------------------------
-    # Step 3: CNN -- deadline accounts for actual RF time + post overhead
+    # Step 3: train the capacity CNN to (timeout - reserve)
     # ------------------------------------------------------------------
-    overhead = max(SAFETY_S, rf_elapsed * 2 + 30)
-    cnn_deadline = _start + args.timeout_seconds - overhead
-    remaining = cnn_deadline - time.monotonic()
-    print(f"CNN budget: {remaining:.0f}s  (timeout={args.timeout_seconds}s  overhead={overhead:.0f}s)")
+    cnn_deadline = hard_deadline - OVERHEAD_S
+    print(f"CNN deadline: {cnn_deadline - time.monotonic():.0f}s of training  "
+          f"(timeout={args.timeout_seconds}s  reserve={OVERHEAD_S}s)", flush=True)
 
-    cnn = build_cnn_bn(k=CNN_K)
-    best = train_cnn(
-        cnn, X_fit, y_fit, X_hold, y_hold,
-        mean=mean, std=std, deadline=cnn_deadline,
-        lr=3e-4, weight_decay=1e-4,
-        batch=64, eval_every_s=30.0, patience=8,
-        target_size=IMG_TRAIN, verbose=True,
+    ckpt_meta = {
+        "arch": "capacity_v1", "widths": WIDTHS, "blocks": BLOCKS,
+        "img_size": TRAIN_IMG, "channels_last": CHANNELS_LAST, "mean": mean, "std": std,
+    }
+    cnn = build_capacity_cnn(widths=WIDTHS, blocks=BLOCKS)
+    best, history, total_steps, final_eval_s = train_capacity(
+        cnn, X_fit, y_fit, X_hold, y_hold, mean, std, cnn_deadline,
+        target_size=TRAIN_IMG, channels_last=CHANNELS_LAST,
+        ckpt_path=out_dir / "best.pt", ckpt_meta=ckpt_meta, verbose=True,
     )
     if best["state"] is None:
         print("ERROR: CNN training produced no checkpoint", file=sys.stderr)
         return 1
     cnn.load_state_dict(best["state"])
-    print(f"CNN best holdout recall={best['recall']:.3f}")
+    cnn.eval()
+    print(f"CNN trained {total_steps} steps; best holdout AUC={best['auc']:.3f} "
+          f"recall={best['recall']:.3f} at step {best['step']} (final eval {final_eval_s:.1f}s)",
+          flush=True)
 
     # ------------------------------------------------------------------
-    # Step 4: ensemble alpha selection on holdout
+    # Step 4: ensemble alpha (reuse the best checkpoint's holdout scores -- no extra CNN
+    # pass) + calibrate the threshold on data/calibration/ (the one unavoidable CNN pass)
     # ------------------------------------------------------------------
-    print("selecting ensemble alpha...")
-    p_cnn_hold = cnn_scores(cnn, X_hold, mean, std, target_size=IMG_TRAIN)
-    p_rf_hold  = classical_pipe.predict_proba(F_hold)[:, 1]
-    alpha = select_alpha(p_cnn_hold, p_rf_hold, y_hold)
+    p_cnn_hold = best["hold_scores"]
+    best_alpha, best_auc = 0.5, -1.0
+    for a in np.linspace(0.0, 1.0, 11):
+        auc = float(roc_auc_score(y_hold, a * p_cnn_hold + (1 - a) * p_rf_hold))
+        if auc > best_auc:
+            best_auc, best_alpha = auc, float(a)
+    alpha = best_alpha
+    print(f"  alpha={alpha:.2f}  holdout ENS AUC={best_auc:.4f}", flush=True)
 
-    # ------------------------------------------------------------------
-    # Step 5: calibrate ensemble threshold on data/calibration/
-    # ------------------------------------------------------------------
-    print("calibrating ensemble threshold on calibration split...")
-    p_cnn_cal = cnn_scores(cnn, X_cal, mean, std, target_size=IMG_TRAIN)
-    p_rf_cal  = classical_pipe.predict_proba(F_cal)[:, 1]
+    t_cal0 = time.monotonic()
+    p_cnn_cal = cnn_scores(cnn, X_cal, mean, std, target_size=TRAIN_IMG)
+    cal_pass_s = time.monotonic() - t_cal0
     p_ens_cal = alpha * p_cnn_cal + (1 - alpha) * p_rf_cal
     thr = pick_threshold_for_fpr(p_ens_cal[y_cal == 0], target_fpr=ENS_TARGET)
-    print(f"  thr={thr:.4f}  cal_fpr_realised={(p_ens_cal[y_cal==0] >= thr).mean():.3f}")
+    cal_fpr = float((p_ens_cal[y_cal == 0] >= thr).mean())
+    print(f"  ENS thr={thr:.4f}  cal_fpr_realised={cal_fpr:.3f}  (target {ENS_TARGET})", flush=True)
 
     # ------------------------------------------------------------------
-    # Step 6: evaluate and print metrics on all splits
+    # Step 5: save best.pt + threshold.json (rf_model.pkl already on disk)
     # ------------------------------------------------------------------
-    print("\n--- Standalone CNN ---")
+    t_save0 = time.monotonic()
+    torch.save({"state": best["state"], "thr": thr, **ckpt_meta}, str(out_dir / "best.pt"))
+    write_threshold_json(out_dir / "threshold.json",
+                         {"thr": thr, "alpha": alpha, "target_fpr": ENS_TARGET})
+    save_s = time.monotonic() - t_save0
+
+    # Post-CNN reserve report: how much of OVERHEAD_S we actually used, so we can judge it.
+    post_cnn_s = time.monotonic() - cnn_deadline
+    print(f"saved best.pt + threshold.json.  POST-CNN RESERVE USED = {post_cnn_s:.1f}s of {OVERHEAD_S}s "
+          f"[final_eval={final_eval_s:.1f}s + cal_pass={cal_pass_s:.1f}s + save={save_s:.1f}s + alpha/overhead]. "
+          f"A 2x/3x-slower grader would use ~{2*post_cnn_s:.0f}s / ~{3*post_cnn_s:.0f}s.", flush=True)
+
+    # ------------------------------------------------------------------
+    # Step 6: metrics (time-guarded; documentation only, never blocks shipping)
+    # ------------------------------------------------------------------
     thr_cnn = pick_threshold_for_fpr(p_cnn_cal[y_cal == 0], target_fpr=ENS_TARGET)
-    for tag, X, y, F in [
-        ("holdout", X_hold, y_hold, F_hold),
-        ("cal",     X_cal,  y_cal,  F_cal),
-        ("val",     X_val,  y_val,  F_val),
-        ("va",      X_va,   y_va,   F_va),
-    ]:
-        p = cnn_scores(cnn, X, mean, std, target_size=IMG_TRAIN)
-        _print_metrics(f"cnn  {tag}", y, p, thr_cnn)
+    thr_rf  = pick_threshold_for_fpr(p_rf_cal[y_cal == 0],  target_fpr=ENS_TARGET)
+    p_cnn = {"holdout": p_cnn_hold, "cal": p_cnn_cal}   # already computed
+    p_rf  = {"holdout": p_rf_hold,  "cal": p_rf_cal}
+    Xs = {"val": X_val, "va": X_va}
+    Fs = {"val": F_val, "va": F_va}
+    for s in ("val", "va"):
+        if time.monotonic() > hard_deadline - METRIC_SAFETY:
+            print(f"  (skipping {s} metrics -- near timeout)", flush=True)
+            continue
+        p_cnn[s] = cnn_scores(cnn, Xs[s], mean, std, target_size=TRAIN_IMG)
+        p_rf[s]  = rf.predict_proba(Fs[s])[:, 1]
 
-    print("\n--- Standalone RF ---")
-    thr_rf = pick_threshold_for_fpr(p_rf_cal[y_cal == 0], target_fpr=ENS_TARGET)
-    for tag, F, y in [
-        ("holdout", F_hold, y_hold),
-        ("cal",     F_cal,  y_cal),
-        ("val",     F_val,  y_val),
-        ("va",      F_va,   y_va),
-    ]:
-        p = classical_pipe.predict_proba(F)[:, 1]
-        _print_metrics(f"rf   {tag}", y, p, thr_rf)
+    ys = {"holdout": y_hold, "cal": y_cal, "val": y_val, "va": y_va}
+    print("\n--- CNN / RF / ENS metrics (calibrated thresholds) ---", flush=True)
+    for s in ("holdout", "cal", "val", "va"):
+        if s not in p_cnn:
+            continue
+        _print_metrics(f"cnn  {s}", ys[s], p_cnn[s], thr_cnn)
+        _print_metrics(f"rf   {s}", ys[s], p_rf[s],  thr_rf)
+        _print_metrics(f"ens  {s}", ys[s], alpha * p_cnn[s] + (1 - alpha) * p_rf[s], thr)
 
-    print("\n--- Ensemble ---")
-    for tag, X, y, F in [
-        ("holdout", X_hold, y_hold, F_hold),
-        ("cal",     X_cal,  y_cal,  F_cal),
-        ("val",     X_val,  y_val,  F_val),
-        ("va",      X_va,   y_va,   F_va),
-    ]:
-        p_cnn = cnn_scores(cnn, X, mean, std, target_size=IMG_TRAIN)
-        p_rf  = classical_pipe.predict_proba(F)[:, 1]
-        p_ens = alpha * p_cnn + (1 - alpha) * p_rf
-        rec, fpr = _print_metrics(f"ens  {tag}", y, p_ens, thr)
-
-    # ------------------------------------------------------------------
-    # Step 7: save artifacts
-    # ------------------------------------------------------------------
-    print("\nsaving artifacts...")
-    import joblib
-
-    torch.save(
-        {"state": best["state"], "k": CNN_K, "img_size": IMG_TRAIN,
-         "mean": mean, "std": std},
-        str(out_dir / "best.pt"),
-    )
-    joblib.dump(classical_pipe, str(out_dir / "rf_model.pkl"))
-    write_threshold_json(
-        out_dir / "threshold.json",
-        {"thr": thr, "alpha": alpha, "target_fpr": ENS_TARGET},
-    )
-
-    elapsed = time.monotonic() - _start
-    print(f"train.py done in {elapsed:.1f}s  (budget={args.timeout_seconds}s)")
+    print(f"\ntrain.py done in {time.monotonic() - _start:.1f}s  (budget={args.timeout_seconds}s)",
+          flush=True)
     return 0
 
 

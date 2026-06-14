@@ -3,7 +3,8 @@
     "allow": [
       "Bash(git rm *)",
       "Bash(python -c ' *)",
-      "Bash(python)"
+      "Bash(python)",
+      "Bash(python -)"
     ]
   }
 }

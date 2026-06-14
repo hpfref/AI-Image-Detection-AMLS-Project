@@ -42,7 +42,7 @@ import time
 
 from _lib import io as _io
 from _lib import seed as _seed
-# from _lib.model import build_appendix_b_cnn
+# from _lib.model import build_capacity_cnn, train_capacity   # Task 1.3 backbone = the Task 1.2 ResNet-SE
 # from _lib.calibration import pick_threshold_for_fpr, write_threshold_json
 
 

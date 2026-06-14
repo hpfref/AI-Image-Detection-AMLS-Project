@@ -45,6 +45,7 @@ from _lib.features import features_from_uint8
 HOLDOUT_FRAC = 0.10
 SPLIT_SEED   = 0
 IMG_SIZE     = _io.IMG_SIZE  # 224
+N_JOBS       = min(8, os.cpu_count() or 1)   # parallel decode workers (grader = --cpus 8)
 
 
 # ---------------------------------------------------------------------------
@@ -117,8 +118,11 @@ def _build_labeled_cache(
     y   = np.zeros(n_total, dtype=np.int64)
     src = np.zeros(n_total, dtype=np.int64)
 
+    from joblib import Parallel, delayed
+
     write_idx = 0
     t0 = time.monotonic()
+    DCHUNK = 1024   # bounded-memory parallel-decode batch (~150 MB of arrays in flight)
     for path in files:
         pf = path.name
         if row_filter is not None and pf not in row_filter:
@@ -126,22 +130,33 @@ def _build_labeled_cache(
         table = pq.read_table(path, columns=["image", "source_class"])
         imgs   = table.column("image")
         labels = table.column("source_class")
+
+        # Ordered work list for this file: (image_bytes, binary_label, source_class).
+        work: list[tuple] = []
         for i in range(len(table)):
             if row_filter is not None and i not in row_filter.get(pf, {}):
                 continue
-            arr = _decode_to_uint8(imgs[i].as_py())
-            if arr is None:
-                continue
-            X[write_idx] = arr
-            label = int(labels[i].as_py())
             if row_filter is not None:
                 bl, sc = row_filter[pf][i]
+            else:
+                lab = int(labels[i].as_py())
+                bl, sc = binarize_label(lab), lab
+            work.append((imgs[i].as_py(), int(bl), int(sc)))
+
+        # Decode in parallel (PIL releases the GIL); write valid rows back in order so the
+        # X/y/src caches stay aligned and identical regardless of worker count.
+        for cs in range(0, len(work), DCHUNK):
+            batch = work[cs:cs + DCHUNK]
+            arrs = Parallel(n_jobs=N_JOBS, prefer="threads")(
+                delayed(_decode_to_uint8)(buf) for buf, _, _ in batch
+            )
+            for (buf, bl, sc), arr in zip(batch, arrs):
+                if arr is None:
+                    continue
+                X[write_idx] = arr
                 y[write_idx]   = bl
                 src[write_idx] = sc
-            else:
-                y[write_idx]   = binarize_label(label)
-                src[write_idx] = label
-            write_idx += 1
+                write_idx += 1
 
     X.flush()
     np.save(str(y_path),   y[:write_idx])

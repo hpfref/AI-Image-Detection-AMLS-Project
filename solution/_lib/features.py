@@ -18,7 +18,12 @@ Performance:
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
+
+# Use all available cores up to the grader's --cpus 8 for the parallel chunk workers.
+N_JOBS = min(8, os.cpu_count() or 1)
 
 # Frequency grid for 224x224 images -- precomputed once, reused by all chunks.
 _IMG = 224
@@ -155,15 +160,18 @@ def _process_chunk(chunk_u8: np.ndarray) -> np.ndarray:
 # Public API
 # ---------------------------------------------------------------------------
 
-def features_from_uint8(X_u8: np.ndarray, chunk: int = 256, n_jobs: int = 4) -> np.ndarray:
+def features_from_uint8(X_u8: np.ndarray, chunk: int = 256, n_jobs: int | None = None) -> np.ndarray:
     """(N, H, W, 3) uint8 -> (N, 101) float32.
 
-    Chunks are processed in parallel (threads) to reduce wall time.
-    n_jobs=4 is conservative: leaves headroom for OS and other processes
-    while giving ~3x speedup on the 26k fit set.
+    Chunks are processed in parallel (threads) to reduce wall time. Defaults to all
+    available cores (capped at the grader's --cpus 8). The numpy ufuncs + FFT release
+    the GIL, so thread workers give near-linear speedup. Output is independent of n_jobs
+    (chunks are concatenated in order), so this only changes wall time, not the features.
     """
     from joblib import Parallel, delayed
 
+    if n_jobs is None:
+        n_jobs = N_JOBS
     starts = list(range(0, len(X_u8), chunk))
     results = Parallel(n_jobs=n_jobs, prefer="threads")(
         delayed(_process_chunk)(np.array(X_u8[s:s + chunk])) for s in starts

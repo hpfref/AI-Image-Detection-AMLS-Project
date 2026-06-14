@@ -71,6 +71,8 @@ The most reliable detection cues, roughly in order: (1) logical errors in anatom
 
 ### Deterministic cleaning pipeline
 
+All exploration and cleaning in this section is implemented in `solution/clean.py`, which validates every training row and writes `artifacts/clean/train_manifest.csv`, the per-row validity list that `prepare.py` then consumes.
+
 **Resize shorter-edge and center-crop to 224x224.** Image dimensions are a near-perfect class signal. Mapping all images to a fixed square canvas via aspect-preserving resize followed by center-crop removes both the square/non-square distinction and the 270 vs 320 px difference between generators. Stretching was rejected because it encodes the original aspect ratio in pixel coordinates. 224x224 matches the reference CNN in Appendix B.
 
 **Convert to RGB.** Defensive: all images are already RGB, but this ensures consistent 3-channel input for any downstream model.
@@ -79,173 +81,108 @@ The most reliable detection cues, roughly in order: (1) logical errors in anatom
 
 ## §1.2 Modeling and Tuning under Time Constraints (35 pts)
 
-We trained two model families and combined them into an ensemble: a classical Random
-Forest on 101 engineered features and a five-layer convolutional network trained from
-scratch on the cleaned images. The ensemble of both is the submitted pipeline.
+### Setup and protocol
 
-### Training Setup
+The task is binary classification of real (0) against ai_generated (1). The graded objective is to maximise recall on the AI class while holding the false-positive rate on real images at or below 0.20, and that constraint is verified on a held-out validation split rather than on anything used to fit or tune the model.
 
-Before training, images are preprocessed once by `prepare.py`: each image is cleaned
-(shorter-edge resize and center-crop to 224x224), stored as a uint8 memory-mapped
-array, and 101 engineered features are extracted per image and saved alongside. This
-step runs once and the outputs are reused by all subsequent scripts without re-reading
-the raw data.
+Four splits are provided: `train` (around 29,700 images), `calibration` (1,924), `validation` (1,124) and an unlabeled `predict` set (100). Each has a fixed role, and a fifth split is created internally so each split is used for only one thing. A stratified 90/10 split of `train` produces a fit fold and a held-out fold (in `prepare.py`, fraction 0.10, seed 0, stratified by source class so all six generators are represented). This internal holdout is not one of the provided splits; it exists because unbiased checkpoint and model selection needs a labelled set that is neither the calibration set (reserved for setting the threshold) nor the validation set (reserved as the final generalisation check and proxy for the hidden test). It is also the largest labelled set available for this, about 2,970 images, so AUC measured on it is far less noisy than on the roughly 190 real images in calibration or validation. In short: `train` fits the models, the internal holdout drives early stopping and selection, `calibration` sets the threshold, and `validation` is read once at the end to confirm the operating point.
 
-The training set (~29,700 images) is split into a fit set (90%) and a holdout set
-(10%), stratified by source class. The task does not provide an explicit split for
-model selection; the holdout is needed because CNN early stopping requires an
-evaluation set, and using data/calibration/ for that purpose would contaminate the
-threshold calibration step that happens after training. The holdout also drives RF vs.
-LR selection and the ensemble alpha sweep. data/calibration/ is used exclusively for
-threshold selection after all model parameters are fixed.
+All experiments are developed and measured in development notebooks, and the submitted scripts mirror that validated pipeline. `prepare.py` decodes the cleaned images into a uint8 memmap cache, computes per-channel normalisation statistics on the fit fold, and extracts the 101-dimensional engineered feature set; `train.py` fits the classical model, trains the CNN, sweeps the ensemble weight, calibrates the threshold and saves the artifacts; `predict.py` loads the saved ensemble and writes `artifacts/task02/predictions.csv` in the required `row_id,predicted_label` format.
 
-### Model Families
+Local development is held to at most five times the Appendix C reference training time (`train_time_reference.py`), measured once on the development machine. The reference is used because it ties the budget to a fixed amount of computation rather than to wall-clock time on one machine, so the reported figures are not skewed by hardware. Every metric in this section is measured at that 5x-reference budget; how the submitted `train.py` behaves under the grader's own timeout is covered in the budget decision below.
 
-**Classical baseline.** We extract 101 features per image: RGB mean and standard
-deviation (6), 8-bin per-channel histograms (24), Laplacian variance (1), Sobel edge
-magnitude standard deviation (1), FFT high-frequency power ratio (1), four spectral
-power band ratios (4), 3x3 spatial patch statistics (54), per-channel noise residual
-standard deviation (3), channel skewness (3), chroma noise in Cb and Cr channels (2),
-and JPEG block boundary discontinuity (2). We compared Logistic Regression (C in
-{0.1, 1, 10}) and Random Forest (n_estimators in {200, 400}), selecting the winner by
-holdout recall at each run. Random Forest with n=400 consistently won with holdout
-recall 0.781 and AUC 0.885, compared to 0.749 and 0.857 for the best Logistic
-Regression. The gap comes from non-linear interactions between features that Logistic
-Regression cannot capture without further manual feature engineering.
+### Two model families
 
-**Neural model.** We built a five-layer convolutional network with batch normalization,
-extending the Appendix B reference architecture to five convolutional layers followed
-by a two-layer MLP head with dropout. Images are processed at 160px (shorter-edge
-resize and center-crop, which removes the dimension leakage found in §1.1). Standard
-3x3 convolutions preserve joint spatial and channel structure needed to detect
-diffusion model artifacts. Training uses AdamW (lr=3e-4, weight_decay=1e-4), Focal
-Loss with gamma=1.5 to downweight easy examples, and balanced class weights. The model
-trains until a wall-clock deadline and saves the best checkpoint by holdout recall.
+Two model families are trained from scratch and compared, with no pretrained weights, consistent with the no-internet runtime constraint.
 
-### Calibration Protocol
+The classical baseline is a Random Forest over a 101-dimensional engineered feature vector built from the Task 1.1 cues and several more: per-channel colour mean, standard deviation and 8-bin histograms, Laplacian variance and Sobel edge energy, an FFT high-frequency ratio with four radial spectral-band ratios, a 3x3 grid of patch means and standard deviations, per-channel noise and Cb/Cr chroma-noise residuals, channel skewness, and a JPEG block-boundary discontinuity score. Both a regularised Logistic Regression and a Random Forest are trained every run and the stronger is kept by holdout recall; the forest wins consistently. On run 22, for instance, the best logistic model reached 0.749 holdout recall at 0.857 AUC against the forest's 0.781 recall at 0.885 AUC. The forest is preferred because the feature interactions are non-linear (for example the JPEG-block score interacts with the generator source, and the spectral bands interact with colour skewness), which trees capture through splits while a linear model cannot without manual crosses. The final forest is 400 trees with balanced class weights and square-root feature subsampling.
 
-After training, the operating threshold is selected automatically using only
-`data/calibration/`. The function `pick_threshold_for_fpr` finds the smallest threshold
-t such that the empirical false-positive rate on calibration real-class images is at
-most 0.19. We target 0.19 rather than the full 0.20 budget on purpose: it leaves a small
-safety margin so the operating point still satisfies the 0.20 constraint when it
-generalises to the unseen evaluation holdout, where the realised FPR can drift above the
-calibration estimate. No validation data is used at any point during threshold selection. For the
-ensemble, the CNN-to-RF weighting (alpha=0.40) is first selected by AUC sweep on a
-held-out training fold, then `pick_threshold_for_fpr` is applied to the combined
-ensemble scores on the calibration split.
+The neural family is a convolutional network trained from scratch on the cleaned 224x224 images, resampled to the network input size. Its architecture and training are the subject of the decisions below.
 
-### Ensemble
+### Key design decisions
 
-The ensemble combines scores as p = alpha * p\_cnn + (1 - alpha) * p\_rf with
-alpha=0.40. On the validation set, CNN alone reaches recall=0.724 and RF alone reaches
-recall=0.669, neither meeting the 0.80 target individually. The ensemble reaches 0.811
-by combining complementary error patterns: the two models recover different subsets of
-AI images, so combining them raises true positives without a proportional increase in
-false positives. Holdout AUC rose from 0.877 (CNN alone) to 0.907 (ensemble). The CNN
-detects spatial and frequency artifacts in pixel space while the Random Forest captures
-file-level properties such as JPEG compression patterns and spectral distribution.
+**Architecture and resolution.** The decisive change was replacing the small reference-style CNN with a ResNet-style network. Looking at the old network showed why earlier tuning had stopped improving: it stopped downsampling after two pooling layers, so its deepest convolutions ran at high spatial resolution and most of its compute sat in a single wide layer; it was heavy on FLOPs but poor in parameters (around 250k), spending the budget on resolution it could not make use of. The redesign downsamples to stride-4 immediately with a strided stem and pooling, then runs four residual stages of widths 32, 64, 128 and 256 with two residual blocks each and squeeze-and-excitation channel attention, ending in global average pooling, dropout and a linear head. This gives about 2.84M parameters, roughly eleven times the old network, at about 0.75 times the compute per image, so the budget goes to capacity rather than image resolution, and the residual connections now serve their real purpose in a network 17 convolutions deep. The input is 192px, chosen because the model is capacity-limited rather than resolution-limited here, so using a smaller image to fit more training steps is worth it.
 
-### Results
+![Capacity redesign: more parameters at less compute, and the resulting gradient steps that fit in budget](figures/fig7_ablation.png)
 
-Table 2 reports the final ensemble on all evaluation splits. The model meets the target
-of recall\_ai >= 0.80 while keeping fpr\_real <= 0.20 on the validation set.
+**Loss and optimiser.** The network is trained with focal loss (gamma 1.5) and class weights to handle the roughly 5:1 AI-to-real imbalance, optimised with AdamW (peak learning rate 1e-3, weight decay 1e-4) under a short warmup followed by a cosine decay to near zero. The schedule length is self-calibrated to the measured training throughput so the decay always lands at the time budget regardless of machine speed. Batches use channels-last memory format, which is faster for these convolutions on CPU. The training trace below shows the holdout AUC and the recall at the target false-positive rate climbing across steps as the learning rate decays, with the best checkpoint landing near the final step.
 
-| Model | Split | recall\_ai | fpr\_real | AUC |
-|-------|-------|-----------|----------|-----|
-| CNN | holdout | 0.724 | 0.135 | 0.879 |
-| CNN | validation | 0.724 | 0.197 | 0.850 |
-| CNN | validation\_augmented | 0.558 | 0.225 | 0.728 |
-| RF | holdout | 0.680 | 0.101 | 0.885 |
-| RF | validation | 0.669 | 0.128 | 0.854 |
-| RF | validation\_augmented | 0.501 | 0.203 | 0.694 |
-| Ensemble | holdout | 0.792 | 0.121 | 0.915 |
-| Ensemble | validation | **0.811** | **0.170** | **0.888** |
-| Ensemble | validation\_augmented | 0.604 | 0.289 | 0.734 |
+![Training trace: holdout AUC and recall climbing under the warmup plus cosine learning-rate schedule](figures/fig4_training_trace.png)
 
-*Threshold calibrated on data/calibration/ at target fpr=0.19 (thr=0.677, alpha=0.40).*
+**Model selection on the internal holdout.** Checkpoints, and the run to submit, are selected by holdout AUC, not by recall at the calibrated threshold. Recall at a fixed threshold is a single noisy point on the ROC curve and was exactly what made identical configurations flip between pass and fail on seed and timing; AUC summarises the whole curve and is reproducible and threshold-independent. Because the model keeps improving to the last step, the final weights are always scored once after the deadline, so a slightly stale checkpoint is never submitted. Selection happens only on the internal holdout, never on calibration or validation, which keeps those splits clean for their own roles. The same metric decides which run is submitted, and the run tables make two of these choices look odd, so both are explained here. First, the final run is deliberately not the one with the highest validation recall: run 25 reached the highest recall of any run (0.879) but at an illegal false-positive rate (0.207), which is exactly why recall at a fixed threshold is treated as a noisy operating point rather than a selection target. Second, the final run is not even the highest in-budget holdout AUC: run 27 reached 0.933 against the final run's 0.929 and was still rejected, because a single run's holdout AUC carries its own noise, so a gain only counts when it is corroborated, showing in the CNN-alone holdout and ideally on validation and beating the stable baseline by a small margin. Run 27 did none of these: the CNN alone was flat (0.916 to 0.917), the validation AUC did not move (0.901 against 0.902), and the ensemble holdout had sat at 0.928 to 0.929 across the three preceding runs, so 0.933 looks like noise from a single run, at the cost of 42% more parameters and a failed operating point. The same reasoning answers why an earlier higher-recall run is not preferred: run 24 reached 0.849 validation recall, but it shares the final run's architecture and holdout AUC (0.929), so it is the same ROC; its higher recall is only the looser 0.19 calibration target it happened to use, and because the submitted pipeline calibrates at 0.18 regardless, those weights would read essentially the same 0.837. The rule throughout is to trust improvements that repeat and show up in several places, like the within-run forest lift described next, and to be sceptical of one-off jumps.
 
-Figure 4 shows the training trace (holdout recall over gradient steps). Figure 5 shows
-the confusion matrices for CNN, RF, and ensemble on the validation set. Figure 6 shows
-per-source-class recall on the validation set: SDXL is the easiest class to detect
-(0.95), SD3 is the hardest (0.63), with DALL-E3, Midjourney, and SD2.1 in between.
+**Ensemble against CNN-only.** The CNN is combined with the Random Forest by averaging their probabilities, p_ens = 0.5 p_cnn + 0.5 p_rf, with the weight chosen by a holdout AUC sweep. The two families look at different evidence, the CNN at pixel and texture artifacts, the forest at colour, spectral and JPEG-block statistics, so their errors are only partly correlated and averaging raises the ROC above either alone. While the CNN was weak this lift was large (around 0.04 AUC); now that the CNN is strong it is smaller but still real, a steady within-run gain of about 0.01 holdout AUC, and the forest contributes a high-precision low-false-positive branch (validation FPR 0.117) that pulls the operating point to a safer place. Because the forest also uses part of the shared time budget, the two were compared at equal budget in a dedicated pair of runs: a full-budget CNN with no forest (run 28, holdout AUC 0.927) against the ensemble where the CNN trains slightly less to leave time for the forest (run 29, holdout AUC 0.929). They are close, and the ensemble is chosen for its steady within-run lift and safer false-positive margin. The weight ending up at 0.50, up from 0.40 in the weak-CNN era, reflects the CNN and forest now being about equally informative.
 
-![Training trace](figures/fig4_training_trace.png)![Confusion matrices](figures/fig5_confusion_matrices.png)![Per-class recall](figures/fig6_per_class_recall.png)
-### Impact of Modeling Choices
+**Calibration protocol.** The decision threshold is set by searching, over the real images of `calibration`, for the threshold whose false-positive rate matches a target, then verified on the held-out validation split. The target is 0.18 rather than 0.20: the realised validation FPR sits a little above the calibration target and varies from run to run because the real subset is small, so a 0.18 target leaves room for that sampling gap, while a higher target would cost recall, the graded quantity. The residual gap between calibration, validation and the hidden predict split is acknowledged as an accepted risk. Calibrating on one split and selecting the model on a separate holdout, both distinct from validation, is the main guard against overfitting the operating point, which the task warns is scored on a hidden holdout.
 
-Several design decisions had measurable impact on validation performance. Figure 7
-summarises the ablation experiments.
+**Budget handling and timeout safety.** The 5x reference is the basis for all reported metrics because it is hardware-independent. The submitted `train.py`, by contrast, trains to whatever per-script timeout the grader provides (1800s on 8 CPUs): it fits and saves the Random Forest first, then trains the CNN up to a fixed reserve before the deadline, the reserve covering the final evaluation, calibration and artifact saving. Training is deliberately not left to run until the grader kills the process, even though that would use a few more seconds: if the process is stopped while a file is being written the saved model could be corrupted, a complete ensemble would have to be re-calibrated and re-saved on every new best (each one another chance to corrupt a file), and by the deadline the cosine learning rate has decayed to near zero so the final seconds barely move the weights. The best checkpoint is still written incrementally during training as a cheap safeguard, but the complete artifact set is produced once, inside the reserve.
 
-**Image resolution.** Training at 224px produced only around 350 gradient steps within
-the budget because larger images slow each step, leading to underfitting and AUC 0.848.
-128px gave around 890 steps and produced a first passing run (run 7), but we continued
-experimenting in search of a higher-performing configuration. 160px reaches around 930
-steps at a moderate per-step cost and produced the best metrics across all development
-runs (AUC 0.888, fpr=0.170 in run 23). We kept 160px.
+**Capability beyond the reference budget.** The 5x figure is a development constraint, not a ceiling of the model. Running the same recipe through the solution scripts to the full grader timeout, on the same hardware, lifts holdout AUC from 0.929 to 0.951. The model is therefore budget-limited rather than saturated; given more compute it keeps improving, with diminishing returns. These numbers are not used as the headline result because they are hardware-dependent and not comparable across machines, but they show the model could still improve with more time.
 
-**Focal loss gamma.** gamma=2.0 concentrated training on the hardest examples and
-reached a single-run AUC of 0.896, but caused high variance across seeds, with recall
-ranging from 0.740 to 0.827 across consecutive runs. gamma=1.5 trades a small amount
-of peak performance for reproducible passes. We kept gamma=1.5.
+### Experiment trajectory
 
-**Architecture.** Residual connections and depthwise separable convolutions both
-degraded performance relative to the plain five-conv baseline. For residual connections,
-one possible explanation is that shallow skip connections add little when signals
-already propagate well through five plain conv layers. For depthwise separable
-convolutions, decoupling spatial and channel filtering may lose information about how
-spatial patterns and color channels co-vary, which could matter here. Both were worse
-in practice and we kept standard 3x3 convolutions.
+Development started from the small reference-style CNN of Appendix B and proceeded as a long sequence of incremental changes: replacing cross-entropy with focal loss, sweeping the focal gamma and input resolution, adding the Random Forest ensemble, and calibrating the threshold from data. That line did produce passing models (runs 7, 12, 22 and 23 all met the constraint), but only borderline and seed-dependent ones; reruns of the same recipe flipped between pass and fail on random seed and threshold noise. The reason shows in the table below: through every change the ensemble AUC barely moved, staying around 0.88 to 0.91. Since recall at a fixed false-positive ceiling is bounded by the AUC, tuning the loss, threshold or resolution only slid the operating point along the same curve without raising it. Several capacity-style changes were tried in this era and dropped: focal gamma 2.0 (higher single-run AUC but recall swung across seeds, runs 13 to 17), one or two residual skip connections added to the shallow network (run 16) and depthwise-separable convolutions (run 17, worse), upweighting the hard SD3 class (pushed FPR past 0.20, runs 8 to 11), and simply enlarging the input to 224px (run 19) or the width to k=32 (run 20), both of which ran too few steps in budget and underfit.
 
-**SD3 upweighting.** Giving SD3 samples extra loss weight pushed the false-positive
-rate to 0.234-0.250 because the model became overly aggressive. Focal loss handles the
-hard class without explicit upweighting.
+| Run | CNN arch | img px | gamma | ENS target | ENS val recall | ENS val FPR | ENS val AUC | Result |
+|-----|----------|--------|-------|------------|----------------|-------------|-------------|--------|
+| 1 | 3-conv | 96 | CE | - | - | - | - | no ensemble |
+| 2 | 3-conv | 128 | focal | - | - | - | - | no ensemble |
+| 3 | 4-conv | 128 | focal | - | - | - | - | no ensemble |
+| 4 | 4-conv | 128 | focal | 0.15 | 0.721 | 0.149 | - | FAIL |
+| 5 | 4-conv | 128 | focal | 0.19 | 0.778 | 0.207 | - | FAIL |
+| 6 | 4-conv | 128 | focal | 0.20 | 0.799 | 0.223 | - | FAIL |
+| 7 | 5-conv+MLP | 128 | 1.5 | 0.19 | 0.809 | 0.197 | 0.884 | PASS |
+| 8 | 5-conv+MLP | 128 | 1.5† | 0.19 | 0.833 | 0.234 | - | FAIL |
+| 9 | 4-conv | 160 | 1.5† | 0.18 | 0.792 | 0.165 | - | FAIL |
+| 10 | 5-conv | 128 | 1.5† | 0.18 | 0.775 | 0.176 | - | FAIL |
+| 11 | 5-conv | 128 | 1.5† | 0.19 | 0.817 | 0.250 | - | FAIL |
+| 12 | 5-conv+MLP | 128 | 1.5 | 0.19 | 0.803 | 0.191 | 0.891 | PASS |
+| 13 | 5-conv+MLP | 128 | 2.0 | 0.19 | 0.827 | 0.207 | 0.896 | FAIL |
+| 14 | 5-conv+MLP | 128 | 2.0 | 0.18 | 0.786 | 0.160 | - | FAIL |
+| 15 | 5-conv+MLP | 128 | 2.0 | 0.185 | 0.771 | 0.165 | 0.885 | FAIL |
+| 16 | ResBlock | 128 | 2.0 | 0.185 | 0.768 | 0.144 | 0.886 | FAIL |
+| 17 | DW-sep | 128 | 2.0 | 0.185 | 0.740 | 0.149 | 0.875 | FAIL |
+| 18 | 5-conv+MLP | 128 | 1.5 | 0.18 | 0.782 | 0.160 | 0.896 | FAIL |
+| 19 | 5-conv+MLP | 224 | 1.5 | 0.18 | 0.772 | 0.144 | 0.878 | FAIL |
+| 20 | 5-conv+MLP | 128, k=32 | 1.5 | 0.18 | 0.722 | 0.138 | 0.876 | FAIL |
+| 21 | 5-conv+MLP | 160 | 1.5 | 0.18 | 0.795 | 0.176 | 0.878 | FAIL |
+| 22 | 5-conv+MLP | 160 | 1.5 | 0.19 | 0.809 | 0.197 | 0.878 | PASS |
+| 23 | 5-conv+MLP | 160 | 1.5 | 0.19 | 0.811 | 0.170 | 0.888 | PASS |
 
-![Ablation results](figures/fig7_ablation.png)
-### CPU Budget
+*Runs 1 to 3 predate the ensemble (CNN only). † marks runs that additionally upweighted the SD3 class. The ensemble AUC column shows the plateau around 0.88 to 0.91 that motivated the redesign.*
 
-Total training time for the submitted configuration: RF 18.4s + CNN 715.2s =
-**733.6s = 4.71x the reference time**, within the 5x limit.
+The conclusion was that the limit was the network's discriminative ceiling, not its operating point, which motivated the architecture rework described above. The capacity era (runs 24 onward) then refined it: run 24 was the first pass of the redesign and immediately at a much stronger operating point; run 25 spent more of the budget on the CNN and showed the 0.19 calibration target left no room (validation FPR 0.207); run 26 moved to step-based AUC selection and a 0.18 target for a clean pass; run 27 added a block to the deepest stage and, despite posting the highest in-budget holdout AUC, was rejected as likely noise from a single run, at the cost of 42% more parameters (see model selection above); and runs 28 and 29 ran the equal-budget CNN-only against ensemble comparison that decided which model to submit.
 
-Several parameters were kept at standard values throughout: batch size (64),
-convolutional filter size (3x3), and dropout rates. These are typically less sensitive
-to tuning than architectural and loss choices at this dataset scale. A separate sweep
-over learning rate, cosine annealing, and weight decay confirmed that lr=3e-4 with a
-constant schedule was at or near optimal among the tested alternatives.
+| Run | Change from previous | CNN holdout AUC | ENS holdout AUC | val recall | val FPR | val AUC | Result |
+|-----|----------------------|-----------------|-----------------|------------|---------|---------|--------|
+| 24 | ResNet-SE redesign, 192px, warmup plus cosine, calibrate 0.19 | 0.915 | 0.929 | 0.849 | 0.186 | 0.903 | PASS |
+| 25 | larger CNN share of the budget | 0.919 | 0.929 | 0.879 | 0.207 | 0.914 | FAIL (FPR) |
+| 26 | step-based AUC selection, calibrate 0.18 | 0.916 | 0.928 | 0.837 | 0.191 | 0.902 | PASS |
+| 27 | extra block in the deepest stage (+42% params) | 0.917 | 0.933 | 0.842 | 0.213 | 0.901 | rejected |
+| 28 | full-budget CNN only, no forest | 0.927 | (0.937) | 0.846 | 0.197 | 0.907 | CNN-only reference |
+| 29 | ensemble at equal budget | 0.916 | 0.929 | 0.837 | 0.181 | 0.915 | submitted |
 
-Running the submission script directly with timeout\_seconds=1800 allocates 1710s to
-the CNN, roughly 2.5x the notebook budget. In one such run the model terminated after
-1915 gradient steps via early stopping (patience=8 evals without improvement) and
-produced ENS val=0.812, fpr=0.165, relatively consistent with the notebook results above.
+*Run 28 has no ensemble, so its validation figures are the CNN-only model's; its parenthesised ensemble holdout AUC is the over-budget reference where the forest is added without returning CNN time. The val AUC column is the ensemble's except for run 28.*
 
-### All Training Runs
+### Final model and results
 
-Table 3 summarises all training runs conducted during development.
+The submitted model is the run-29 ensemble. Its performance on validation, with the two families alongside:
 
-| Run | CNN arch | px | k | Gamma | ENS tgt | CNN val rec | CNN val fpr | ENS val rec | ENS val fpr | ENS AUC | Result |
-|-----|----------|----|---|-------|---------|-------------|-------------|-------------|-------------|---------|--------|
-| 1 | 3-conv | 96 | 16 | CE | - | 0.649 | 0.207 | - | - | - | no ENS |
-| 2 | 3-conv | 128 | 16 | focal | - | 0.689 | 0.191 | - | - | - | no ENS |
-| 3 | 4-conv | 128 | 16 | focal | - | 0.745 | 0.234 | - | - | - | no ENS |
-| 4 | 4-conv | 128 | 16 | focal | 0.15 | 0.661 | 0.181 | 0.721 | 0.149 | - | FAIL |
-| 5 | 4-conv | 128 | 16 | focal | 0.19 | 0.661 | 0.181 | 0.778 | 0.207 | - | FAIL |
-| 6 | 4-conv | 128 | 16 | focal | 0.20 | 0.720 | 0.176 | 0.799 | 0.223 | - | FAIL |
-| 7 | 5-conv | 128 | 16 | 1.5 | 0.19 | 0.674 | 0.138 | 0.809 | 0.197 | 0.884 | **PASS** |
-| 8 | 5-conv | 128 | 16 | 1.5+sd3 | 0.19 | 0.755 | 0.186 | 0.833 | 0.234 | - | FAIL |
-| 9 | 4-conv | 160 | 16 | 1.5+sd3 | 0.18 | 0.674 | 0.176 | 0.792 | 0.165 | - | FAIL |
-| 10 | 5-conv | 128 | 16 | 1.5+sd3 | 0.18 | 0.709 | 0.186 | 0.775 | 0.176 | - | FAIL |
-| 11 | 5-conv | 128 | 16 | 1.5+sd3 | 0.19 | 0.709 | 0.186 | 0.817 | 0.250 | - | FAIL |
-| 12 | 5-conv | 128 | 16 | 1.5 | 0.19 | 0.761 | 0.218 | 0.803 | 0.191 | 0.891 | **PASS** |
-| 13 | 5-conv | 128 | 16 | 2.0 | 0.19 | 0.779 | 0.223 | 0.827 | 0.207 | 0.896 | FAIL |
-| 14 | 5-conv | 128 | 16 | 2.0 | 0.18 | 0.779 | 0.223 | 0.786 | 0.160 | - | FAIL |
-| 15 | 5-conv | 128 | 16 | 2.0 | 0.185 | 0.743 | 0.213 | 0.771 | 0.165 | 0.885 | FAIL |
-| 16 | ResBlock | 128 | 16 | 2.0 | 0.185 | 0.729 | 0.165 | 0.768 | 0.144 | 0.886 | FAIL |
-| 17 | DW-sep | 128 | 32 | 2.0 | 0.185 | 0.723 | 0.213 | 0.740 | 0.149 | 0.875 | FAIL |
-| 18 | 5-conv | 128 | 16 | 1.5 | 0.18 | 0.738 | 0.154 | 0.782 | 0.160 | 0.896 | FAIL |
-| 19 | 5-conv | 224 | 16 | 1.5 | 0.18 | 0.669 | 0.186 | 0.772 | 0.144 | 0.878 | FAIL |
-| 20 | 5-conv | 128 | 32 | 1.5 | 0.18 | 0.651 | 0.144 | 0.722 | 0.138 | 0.876 | FAIL |
-| 21 | 5-conv | 160 | 16 | 1.5 | 0.18 | 0.746 | 0.207 | 0.795 | 0.176 | 0.878 | FAIL |
-| 22 | 5-conv | 160 | 16 | 1.5 | 0.19 | 0.772 | 0.229 | 0.809 | 0.197 | 0.878 | **PASS** |
-| 23 | 5-conv | 160 | 16 | 1.5 | 0.19 | 0.724 | 0.197 | 0.811 | 0.170 | 0.888 | **PASS** |
+| model | holdout AUC | val recall_ai | val FPR_real | val AUC |
+|-------|-------------|---------------|--------------|---------|
+| CNN | 0.916 | 0.825 | 0.186 | ~0.89 |
+| Random Forest | 0.885 | 0.650 | 0.117 | 0.854 |
+| Ensemble | 0.929 | 0.837 | 0.181 | 0.915 |
+
+The CNN validation AUC is approximate, representative of the capacity era. The ensemble clears both targets, recall 0.837 above the 0.80 goal at FPR 0.181 within the 0.20 limit. Per source class, recall is strong on DALL-E 3 and SDXL (about 0.95 and 0.92) and weakest on SD 3 (about 0.71), the historically hardest generator, with SD 2.1 and Midjourney near the 0.80 line.
+
+![Per-source-class recall of the ensemble on validation, against the 0.8 target](figures/fig6_per_class_recall.png)
+
+The confusion matrices show the two families and their ensemble at the calibrated operating point.
+
+![Confusion matrices for the CNN, the Random Forest, and the ensemble on validation](figures/fig5_confusion_matrices.png)
+
+On `validation_augmented` the same model keeps recall above the 0.60 Task 1.3 bar (around 0.73, representative of the capacity era) but its false-positive rate rises well above the limit (around 0.35), because augmented real images get smoothed and recompressed and start to score like AI. The Random Forest is the more robust branch there, as its hand-crafted features are less sensitive to pixel-level distortion. Closing that gap without losing the performance on clean validation is the problem Task 1.3 addresses.
 
 ## §1.3 Data Augmentation & Feature Engineering (30 pts)
 

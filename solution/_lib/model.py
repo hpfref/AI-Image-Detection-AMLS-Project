@@ -1,12 +1,12 @@
 """
 Model architectures plus training/inference utilities.
 
-Includes the reference CNN from PDF Appendix B as a starting point. Per PDF
-§1.2 you must compare at least two model families in the report -- e.g. this
-CNN vs. a classical engineered-feature baseline -- but only the single best
-pipeline is packaged in solution/.
-
-Final Task 1.2 model: build_cnn_bn (5-conv BN, k=16, 160px, FocalLoss gamma=1.5).
+Final Task 1.2 model (shipped): a ResNet-SE capacity CNN (build_capacity_cnn) trained
+with FocalLoss(gamma=1.5) + class weights and a warmup+cosine LR schedule, the checkpoint
+selected by holdout AUC. At inference it is ensembled with a RandomForest on 101-dim
+engineered features. See notebooks/task12_experiment_log.md "Key Decisions" for the full
+rationale. The plain Appendix-B / 5-conv baselines from earlier runs were removed once the
+capacity CNN superseded them (history lives in the experiment log + the archived notebook).
 """
 
 from __future__ import annotations
@@ -20,49 +20,7 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Reference architecture (PDF Appendix B)
-# ---------------------------------------------------------------------------
-
-def build_appendix_b_cnn(k: int = 32) -> nn.Module:
-    """Reference CNN from PDF Appendix B.
-
-    Two nn.Sequential blocks (`features` + `classifier`) are wrapped here as a
-    single nn.Sequential so it can be used directly with optimizer / loss.
-    Treat as a starting point, not a final solution.
-    """
-
-    # --- BEGIN: copied from PDF Appendix B ---
-    features = nn.Sequential(
-        nn.Conv2d(3, k, kernel_size=3, padding=1),
-        nn.ReLU(),
-        nn.MaxPool2d(kernel_size=2),
-        nn.Conv2d(k, 2 * k, kernel_size=3, padding=1),
-        nn.ReLU(),
-        nn.MaxPool2d(kernel_size=2),
-        nn.Conv2d(2 * k, 4 * k, kernel_size=3, padding=1),
-        nn.ReLU(),
-        nn.AdaptiveAvgPool2d(1),
-    )
-    classifier = nn.Sequential(
-        nn.Flatten(),
-        nn.Linear(4 * k, 2),
-    )
-    # --- END: copied from PDF Appendix B ---
-
-    return nn.Sequential(features, classifier)
-
-
-def build_classical_baseline():
-    """Engineered-feature baseline (e.g. color/texture stats + logistic reg).
-
-    Required for PDF §1.2 ("at least two different model families") so the
-    report can compare a classical baseline against the CNN.
-    """
-    raise NotImplementedError("Task 1.2: implement classical baseline")
-
-
-# ---------------------------------------------------------------------------
-# Final Task 1.2 architecture
+# Loss
 # ---------------------------------------------------------------------------
 
 class FocalLoss(nn.Module):
@@ -86,33 +44,86 @@ class FocalLoss(nn.Module):
         return loss.mean()
 
 
-def build_cnn_bn(k: int = 16, num_classes: int = 2) -> nn.Module:
-    """5-conv BN architecture (Task 1.2 final model).
+# ---------------------------------------------------------------------------
+# Final Task 1.2 architecture: ResNet-SE capacity CNN
+# ---------------------------------------------------------------------------
 
-    Standard 3x3 conv preserves joint spatial+channel mixing needed to detect
-    per-pixel AI artifacts. k=16 fits ~1700s of CPU training within the
-    timeout_seconds=1800 budget.
+class SEBlock(nn.Module):
+    """Squeeze-excitation channel attention. Cheap on CPU, recalibrates channels."""
+
+    def __init__(self, ch, reduction=8):
+        super().__init__()
+        hidden = max(ch // reduction, 4)
+        self.fc1 = nn.Linear(ch, hidden)
+        self.fc2 = nn.Linear(hidden, ch)
+
+    def forward(self, x):
+        s = x.mean(dim=(2, 3))                 # GAP -> (N, C)
+        s = torch.sigmoid(self.fc2(F.relu(self.fc1(s))))
+        return x * s.unsqueeze(-1).unsqueeze(-1)
+
+
+class BasicBlock(nn.Module):
+    """ResNet basic block: 2x conv3x3-BN with SE on the residual branch, then skip."""
+
+    def __init__(self, in_c, out_c, stride=1, se_reduction=8):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_c, out_c, 3, stride=stride, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(out_c)
+        self.conv2 = nn.Conv2d(out_c, out_c, 3, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(out_c)
+        self.se    = SEBlock(out_c, se_reduction)
+        self.down  = None
+        if stride != 1 or in_c != out_c:
+            self.down = nn.Sequential(
+                nn.Conv2d(in_c, out_c, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_c),
+            )
+
+    def forward(self, x):
+        idt = x if self.down is None else self.down(x)
+        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        out = self.se(self.bn2(self.conv2(out)))
+        return F.relu(out + idt, inplace=True)
+
+
+class CapacityCNN(nn.Module):
+    """Stem conv3x3 s2 + MaxPool2 (stride-4) -> 4 residual+SE stages -> GAP -> Linear.
+
+    Downsampling to stride-4 immediately puts the expensive stages at low resolution,
+    buying ~11x the parameters of the old 5-conv net at less compute (more capacity where
+    it is usable). Standard 3x3 convs (not depthwise-separable): AI-artifact detection
+    needs joint spatial+channel mixing.
     """
-    def _block(in_c, out_c):
-        return nn.Sequential(
-            nn.Conv2d(in_c, out_c, 3, padding=1),
-            nn.BatchNorm2d(out_c),
-            nn.ReLU(),
+
+    def __init__(self, widths=(32, 64, 128, 256), blocks=(2, 2, 2, 2),
+                 se_reduction=8, dropout=0.2, num_classes=2):
+        super().__init__()
+        c0 = widths[0]
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, c0, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(c0), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        stages, in_c = [], c0
+        for si, (w, nb) in enumerate(zip(widths, blocks)):
+            for bi in range(nb):
+                stride = 2 if (bi == 0 and si > 0) else 1
+                stages.append(BasicBlock(in_c, w, stride=stride, se_reduction=se_reduction))
+                in_c = w
+        self.stages = nn.Sequential(*stages)
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+            nn.Dropout(dropout), nn.Linear(in_c, num_classes),
         )
 
-    return nn.Sequential(
-        _block(3,    k),   nn.MaxPool2d(2),
-        _block(k,  2*k),   nn.MaxPool2d(2),
-        _block(2*k, 4*k),
-        _block(4*k, 8*k),
-        _block(8*k, 8*k),
-        nn.AdaptiveAvgPool2d(1),
-        nn.Flatten(),
-        nn.Dropout(0.3),
-        nn.Linear(8 * k, 4 * k), nn.ReLU(),
-        nn.Dropout(0.2),
-        nn.Linear(4 * k, num_classes),
-    )
+    def forward(self, x):
+        return self.head(self.stages(self.stem(x)))
+
+
+def build_capacity_cnn(**kw) -> nn.Module:
+    """Factory for the shipped ResNet-SE CNN (defaults = the run-29 architecture)."""
+    return CapacityCNN(**kw)
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +143,7 @@ def batch_to_chw(
     X_u8: np.ndarray,
     mean: np.ndarray,
     std: np.ndarray,
-    target_size: int = 160,
+    target_size: int = 192,
 ) -> torch.Tensor:
     """uint8 memmap slice -> normalized CHW float tensor, downsampled to target_size.
 
@@ -153,7 +164,7 @@ def cnn_scores(
     mean: np.ndarray,
     std: np.ndarray,
     batch: int = 128,
-    target_size: int = 160,
+    target_size: int = 192,
 ) -> np.ndarray:
     """Run inference and return AI-class softmax probabilities."""
     model.eval()
@@ -166,7 +177,15 @@ def cnn_scores(
     return np.concatenate(out)
 
 
-def train_cnn(
+def cosine_lr(step, peak, floor, warmup, total):
+    """Linear warmup for `warmup` steps, then cosine decay from peak to floor over `total`."""
+    if step < warmup:
+        return peak * (step + 1) / max(1, warmup)
+    prog = min(1.0, (step - warmup) / max(1, total - warmup))
+    return floor + 0.5 * (peak - floor) * (1.0 + np.cos(np.pi * prog))
+
+
+def train_capacity(
     model: nn.Module,
     X_fit: np.ndarray,
     y_fit: np.ndarray,
@@ -175,77 +194,134 @@ def train_cnn(
     mean: np.ndarray,
     std: np.ndarray,
     deadline: float,
-    lr: float = 3e-4,
-    weight_decay: float = 1e-4,
+    *,
+    peak_lr: float = 1e-3,
+    lr_floor_frac: float = 0.01,
+    warmup_cap: int = 300,
     batch: int = 64,
-    eval_every_s: float = 30.0,
-    patience: int = 8,
-    target_size: int = 160,
+    n_evals: int = 16,
+    tail_power: float = 2.0,
+    patience: int = 12,
+    target_size: int = 192,
+    channels_last: bool = True,
+    ckpt_path=None,
+    ckpt_meta: dict | None = None,
     verbose: bool = True,
-) -> dict:
-    """Train CNN until deadline; return best checkpoint dict by holdout recall.
+) -> tuple:
+    """Train to `deadline`; return (best, history, total_steps, final_eval_s).
 
-    Returned dict keys: 'recall', 'state' (state_dict copy), 'thr'.
+    Selection: the single checkpoint with the highest HOLDOUT AUC (smooth, threshold-
+    independent); recall@fpr.20 is logged for the trace only. The schedule (warmup+cosine)
+    self-calibrates to measured steps/s at step 30, eval is step-based and tail-weighted
+    (gaps shrink toward the deadline so the still-improving end is sampled densely), and the
+    final weights are always scored once after the loop (the model improves to the last step).
+
+    If `ckpt_path` is given, the best checkpoint is written to disk on each new best (PDF
+    advice: regularly persist the best checkpoint). The payload is
+    {"state", **ckpt_meta} so it is directly loadable by predict.py; the deadline is set by
+    the caller with enough reserve that the final RF + calibration + save still complete.
     """
+    from sklearn.metrics import roc_auc_score
+
     from _lib.calibration import pick_threshold_for_fpr
 
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    w = class_weights(y_fit)
-    loss_fn = FocalLoss(gamma=1.5, weight=w)
-    yt_fit = torch.from_numpy(y_fit).long()
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    opt = torch.optim.AdamW(model.parameters(), lr=peak_lr, weight_decay=1e-4)
+    loss_fn = FocalLoss(gamma=1.5, weight=class_weights(y_fit))
+    yt = torch.from_numpy(y_fit).long()
+    floor = lr_floor_frac * peak_lr
     n = len(X_fit)
 
-    best = {"recall": -1.0, "state": None, "thr": 0.5}
-    last_eval = time.monotonic()
-    no_improve = 0
-    step = 0
+    best = {"auc": -1.0, "recall": -1.0, "fpr": 1.0, "state": None, "thr": 0.5, "step": 0,
+            "hold_scores": None}
+    history: list[dict] = []
+    no_improve = step = 0
     loss_win: list[float] = []
-    WINDOW = 50
+    warmup = warmup_cap            # provisional until steps/s measured at step 30
+    total_est = None
+    schedule, si = [], 0           # step-based eval steps, gaps shrinking toward the deadline
+    t_start = time.monotonic()
+
+    def _persist():
+        if ckpt_path is not None and best["state"] is not None:
+            payload = {"state": best["state"]}
+            if ckpt_meta:
+                payload.update(ckpt_meta)
+            torch.save(payload, str(ckpt_path))
+
+    def do_eval(tag, lr_val):
+        nonlocal no_improve
+        scores = cnn_scores(model, X_hold, mean, std, target_size=target_size)
+        thr = pick_threshold_for_fpr(scores[y_hold == 0], target_fpr=0.20)
+        yp = (scores >= thr).astype(int)
+        tp = int(((yp == 1) & (y_hold == 1)).sum()); fn = int(((yp == 0) & (y_hold == 1)).sum())
+        fp = int(((yp == 1) & (y_hold == 0)).sum()); tn = int(((yp == 0) & (y_hold == 0)).sum())
+        rec = tp / (tp + fn) if tp + fn else 0.0
+        fpr = fp / (fp + tn) if fp + tn else 0.0
+        auc = float(roc_auc_score(y_hold, scores))
+        lma = float(np.mean(loss_win)) if loss_win else float("nan")
+        history.append({"step": step, "lr": lr_val, "loss": lma,
+                        "recall": rec, "fpr": fpr, "auc": auc, "tag": tag})
+        if verbose:
+            print(f"  step={step:5d} lr={lr_val:.2e} loss={lma:.3f} "
+                  f"hold recall={rec:.3f} fpr={fpr:.3f} auc={auc:.3f} ({tag})", flush=True)
+        if auc > best["auc"] + 1e-4:
+            best.update(auc=auc, recall=rec, fpr=fpr, thr=thr, step=step,
+                        state={k: v.clone() for k, v in model.state_dict().items()},
+                        hold_scores=scores)   # reused for the ensemble alpha sweep (no extra pass)
+            no_improve = 0
+            _persist()
+        else:
+            no_improve += 1
+        model.train()
 
     model.train()
+    lr = peak_lr
     while time.monotonic() < deadline:
         perm = np.random.permutation(n)
         for i in range(0, n, batch):
             if time.monotonic() >= deadline:
                 break
+            if step == 30:  # calibrate LR schedule + eval plan to measured throughput
+                sps = (time.monotonic() - t_start) / 30.0
+                total_est = step + int((deadline - time.monotonic()) / sps)
+                warmup = min(warmup_cap, int(0.05 * total_est))
+                # tail-weighted eval steps: gaps shrink toward total_est so the still-improving
+                # end of training is sampled densely; total stays ~n_evals (bounded eval cost).
+                raw = [int(total_est * (1 - (1 - k / n_evals) ** tail_power))
+                       for k in range(1, n_evals + 1)]
+                schedule = sorted(s for s in set(raw) if s > step)
+                if verbose:
+                    print(f"  [sched] {sps:.3f}s/step  total_est={total_est}  warmup={warmup}  "
+                          f"evals={len(schedule)}  last_steps={schedule[-3:]}", flush=True)
+            lr = cosine_lr(step, peak_lr, floor, warmup, total_est or 2000)
+            for g in opt.param_groups:
+                g["lr"] = lr
+
             ix = perm[i:i+batch]
             xt = batch_to_chw(ix, X_fit, mean, std, target_size=target_size)
-            logits = model(xt)
-            loss = loss_fn(logits, yt_fit[ix])
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+            if channels_last:
+                xt = xt.contiguous(memory_format=torch.channels_last)
+            loss = loss_fn(model(xt), yt[torch.from_numpy(ix)])
+            opt.zero_grad(); loss.backward(); opt.step()
             step += 1
             loss_win.append(float(loss.item()))
-            if len(loss_win) > WINDOW:
+            if len(loss_win) > 50:
                 loss_win.pop(0)
 
-            if time.monotonic() - last_eval >= eval_every_s:
-                scores = cnn_scores(model, X_hold, mean, std, target_size=target_size)
-                thr = pick_threshold_for_fpr(scores[y_hold == 0], target_fpr=0.20)
-                y_pred = (scores >= thr).astype(int)
-                tp = int(((y_pred == 1) & (y_hold == 1)).sum())
-                fn = int(((y_pred == 0) & (y_hold == 1)).sum())
-                fp = int(((y_pred == 1) & (y_hold == 0)).sum())
-                tn = int(((y_pred == 0) & (y_hold == 0)).sum())
-                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-                loss_ma = float(np.mean(loss_win)) if loss_win else 0.0
-                if verbose:
-                    print(f"  step={step:5d}  loss={loss_ma:.3f}  holdout recall={rec:.3f}  fpr={fpr:.3f}")
-                if rec > best["recall"] + 1e-4:
-                    best = {
-                        "recall": rec,
-                        "state":  {k: v.clone() for k, v in model.state_dict().items()},
-                        "thr":    thr,
-                    }
-                    no_improve = 0
-                else:
-                    no_improve += 1
-                model.train()
-                last_eval = time.monotonic()
-                if no_improve >= patience:
+            if si < len(schedule) and step >= schedule[si]:
+                do_eval("periodic", lr)
+                si += 1
+                if no_improve >= patience:   # guard only; AUC is smooth so this rarely trips
                     if verbose:
-                        print(f"  early stop after {patience} evals without improvement")
-                    return best
-    return best
+                        print(f"  early stop: no AUC improvement in {patience} evals", flush=True)
+                    deadline = 0.0           # force the outer while to exit
+                    break
+
+    # Guaranteed final eval: the model improves to the very last step, so always score the
+    # final weights once and let AUC-selection consider them.
+    t_fe = time.monotonic()
+    do_eval("final", lr)
+    final_eval_s = time.monotonic() - t_fe
+    return best, history, step, final_eval_s
